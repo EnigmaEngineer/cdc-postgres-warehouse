@@ -1,0 +1,7 @@
+# Every line here is imported by code in this repo. Checked with ast over every .py file,
+# see tests/test_deps.py, which fails when a third party import is not declared here.
+#
+# psycopg2-binary rather than psycopg2 because psycopg2 compiles against libpq headers and
+# this repo is meant to run on a machine with nothing installed. The binary wheel carries
+# its own libpq. Pinned to the version the change decoding figures in the README came off.
+psycopg2-binary==2.9.12
