@@ -1,0 +1,37 @@
+# One service, because one service is all the code in this repo currently contacts.
+#
+# Kafka, Kafka Connect and Debezium belong in a change data capture stack and none of them
+# are here yet. A compose file that lists services nothing connects to is an architecture
+# claim the repo cannot back, so each one goes in on the day something starts speaking to it.
+#
+#   docker compose up -d
+#   python -m load.generate --dsn "host=127.0.0.1 port=55432 dbname=shop user=postgres"
+#
+# There is no Docker daemon on the machine this was built on. scripts/bootstrap-local.sh is
+# the path that has actually run here. This file is the laptop path and it is the less
+# tested of the two.
+
+services:
+  postgres:
+    image: postgres:14
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
