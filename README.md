@@ -160,6 +160,10 @@ the repo is correct would do the same thing if it were scanning nothing.
 - **The field counter in `cdc/decode.py` counts `name[type]:` runs.** A text value that
   contains one inflates the count. Nothing written here produces such a value and
   `tests/test_decode.py` pins the behaviour so the limit fails loudly if the parser moves.
+- **The probe loads the schema by handing the whole file to `cur.execute`.** That works
+  because `db/schema.sql` is plain SQL. A file carrying a psql meta-command would break it,
+  and the failure would look like a syntax error in the schema rather than in the loader.
+
 - **The `pgoutput` frames are counted and never parsed.** The probe opens a second slot on
   the same workload and reports the message count and the total bytes. That is enough to
   say the binary stream a consumer reads grows by 1.3019 while its message count does not
