@@ -29,6 +29,24 @@ def before_coverage(summary):
     return round(summary["before_present"] / total, 4)
 
 
+def spread(values):
+    """Range across repeats of the same measurement.
+
+    A difference smaller than this is not a result. Returns None for relative spread when
+    the smallest value is zero, for the same reason ratio does.
+    """
+    if not values:
+        raise ValueError("spread needs at least one value")
+    lo, hi = min(values), max(values)
+    return {
+        "n": len(values),
+        "min": lo,
+        "max": hi,
+        "range": hi - lo,
+        "relative": None if lo == 0 else round((hi - lo) / lo, 6),
+    }
+
+
 def compare(arms):
     """arms is a dict of name to {'wal_bytes': int, 'summary': dict}.
 
@@ -40,12 +58,28 @@ def compare(arms):
     base = arms["default"]
     out = {}
     for name, arm in sorted(arms.items()):
+        s = arm["summary"]
         out[name] = {
             "wal_bytes": arm["wal_bytes"],
             "wal_ratio_vs_default": ratio(base["wal_bytes"], arm["wal_bytes"]),
-            "changes": arm["summary"]["changes"],
-            "before_coverage": before_coverage(arm["summary"]),
-            "mean_before_fields": arm["summary"]["mean_before_fields"],
-            "mean_after_fields": arm["summary"]["mean_after_fields"],
+            "changes": s["changes"],
+            "before_coverage": before_coverage(s),
+            # The raw counts go out beside the fraction on purpose. A coverage of 0.1599
+            # is not readable until you can see it is 188 out of 1176, and writing that
+            # division into a sentence by hand is how a corrected numerator leaves a
+            # stale total behind it.
+            "before_present": s["before_present"],
+            "before_absent": s["before_absent"],
+            "updates_with_before_image": s["updates_with_before_image"],
+            "updates": s["by_action"].get("UPDATE", 0),
+            "deletes": s["by_action"].get("DELETE", 0),
+            "mean_before_fields": s["mean_before_fields"],
+            "mean_after_fields": s["mean_after_fields"],
+            "pgoutput_messages": arm.get("pgoutput_messages"),
+            "pgoutput_bytes": arm.get("pgoutput_bytes"),
+            # The write ahead log ratio is what a DBA looks at. This is what the consumer
+            # actually receives, and the two are not the same number.
+            "pgoutput_ratio_vs_default": ratio(base.get("pgoutput_bytes", 0),
+                                               arm.get("pgoutput_bytes", 0)),
         }
     return out

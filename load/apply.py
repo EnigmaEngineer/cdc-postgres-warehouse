@@ -146,9 +146,16 @@ class Applier:
         applied = {"insert": 0, "update": 0, "delete": 0}
         skipped = 0
         for op in ops:
-            fn = getattr(self, "{}_{}".format(op.action, op.table), None)
-            if fn is None or not self.ids[op.table] and op.action != "insert":
-                # The plan already deflects this case. If it reaches here the plan and the
+            name = "{}_{}".format(op.action, op.table)
+            fn = getattr(self, name, None)
+            if fn is None:
+                # A weight table that asks for an operation this class cannot perform is a
+                # configuration mistake and it has to be loud. Counting it as skipped would
+                # let a whole arm of the workload quietly do nothing.
+                raise NotImplementedError(
+                    "the plan asked for {} and Applier has no {}".format(op, name))
+            if not self.ids[op.table] and op.action != "insert":
+                # The plan already deflects this case. Reaching it means the plan and the
                 # applier disagree about the population, which is a bug and not a warning.
                 skipped += 1
                 continue

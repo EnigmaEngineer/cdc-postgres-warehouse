@@ -26,6 +26,8 @@ from load import workload  # noqa: E402
 
 TABLES = ("shop.customer", "shop.product", "shop.order_header", "shop.order_item")
 SLOT = "probe_slot"
+SLOT_PGO = "probe_slot_pgoutput"
+PUBLICATION = "cdc_shop"
 
 
 class SourceRefused(Exception):
@@ -50,7 +52,12 @@ def run_arm(cur, schema_path, mode, seed, steps, customers, products):
         pg.set_replica_identity(cur, t, mode)
 
     pg.drop_slot_if_exists(cur, SLOT)
+    pg.drop_slot_if_exists(cur, SLOT_PGO)
     pg.create_slot(cur, SLOT)
+    # Two slots over one workload. test_decoding is readable and pgoutput is what a real
+    # consumer subscribes to. Reading only the readable one would leave the claim that
+    # they agree resting on nothing.
+    pg.create_slot(cur, SLOT_PGO, "pgoutput")
 
     seed_rows = dict.fromkeys(workload.TABLES, 0)
     seed_rows["customer"] = customers
@@ -65,16 +72,21 @@ def run_arm(cur, schema_path, mode, seed, steps, customers, products):
     except psycopg2.errors.ObjectNotInPrerequisiteState as exc:
         cur.connection.rollback()
         pg.drop_slot_if_exists(cur, SLOT)
+        pg.drop_slot_if_exists(cur, SLOT_PGO)
         raise SourceRefused(str(exc).strip().splitlines()[0])
     end = pg.current_lsn(cur)
 
     lines = pg.peek_changes(cur, SLOT)
     summary = decode.summarise(decode.parse_stream(lines))
+    msgs, pgo_bytes = pg.peek_binary_changes(cur, SLOT_PGO, PUBLICATION)
     pg.drop_slot_if_exists(cur, SLOT)
+    pg.drop_slot_if_exists(cur, SLOT_PGO)
 
     return {
         "wal_bytes": pg.lsn_bytes(cur, start, end),
         "summary": summary,
+        "pgoutput_messages": msgs,
+        "pgoutput_bytes": pgo_bytes,
         "applied": applied,
         "skipped": skipped,
         "deflected": plan.deflected,
@@ -91,6 +103,9 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--customers", type=int, default=200)
     ap.add_argument("--products", type=int, default=80)
+    ap.add_argument("--passes", type=int, default=3,
+                    help="repeats of each arm. The spread across them is the floor under "
+                         "any difference the arms show.")
     args = ap.parse_args(argv)
 
     con = pg.connect(args.dsn)
@@ -101,26 +116,33 @@ def main(argv=None):
 
     run_arm(cur, args.schema, "DEFAULT", **kw)          # warmup, discarded
 
-    arms = {}
+    passes = {}
     refused = {}
     for name, mode in (("default", "DEFAULT"), ("full", "FULL"), ("nothing", "NOTHING")):
-        try:
-            arms[name] = run_arm(cur, args.schema, mode, **kw)
-        except SourceRefused as exc:
-            refused[name] = str(exc)
+        runs = []
+        for _ in range(args.passes):
+            try:
+                runs.append(run_arm(cur, args.schema, mode, **kw))
+            except SourceRefused as exc:
+                refused[name] = str(exc)
+                break
+        if runs:
+            passes[name] = runs
 
-    # Repeat of the first real arm. If this does not match, the arms are measuring drift
-    # rather than the setting, and nothing below is worth reading.
-    repeat = run_arm(cur, args.schema, "DEFAULT", **kw)
+    # The first pass of each arm is the one reported. The rest exist to say how much of
+    # any gap between two arms is just noise.
+    arms = {k: v[0] for k, v in passes.items()}
 
     out = {
         "arms": probe.compare(arms),
         "refused_by_source": refused,
         "reproducibility": {
-            "default_wal_bytes_first": arms["default"]["wal_bytes"],
-            "default_wal_bytes_repeat": repeat["wal_bytes"],
-            "default_changes_first": arms["default"]["summary"]["changes"],
-            "default_changes_repeat": repeat["summary"]["changes"],
+            name: {
+                "wal_bytes": probe.spread([r["wal_bytes"] for r in runs]),
+                "changes": probe.spread([r["summary"]["changes"] for r in runs]),
+                "pgoutput_bytes": probe.spread([r["pgoutput_bytes"] for r in runs]),
+            }
+            for name, runs in sorted(passes.items())
         },
         "applied": arms["default"]["applied"],
         "skipped": arms["default"]["skipped"],

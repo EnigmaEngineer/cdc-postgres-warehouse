@@ -81,6 +81,7 @@ def summarise(changes):
     by_table = {}
     before_present = 0
     before_absent = 0
+    updates_with_before = 0
     after_width = []
     before_width = []
 
@@ -92,6 +93,8 @@ def summarise(changes):
             if c.before:
                 before_present += 1
                 before_width.append(len(c.before))
+                if c.action == "UPDATE":
+                    updates_with_before += 1
             else:
                 before_absent += 1
         if c.after:
@@ -103,6 +106,7 @@ def summarise(changes):
         "by_table": {"{}:{}".format(t, a): n for (t, a), n in sorted(by_table.items())},
         "before_present": before_present,
         "before_absent": before_absent,
+        "updates_with_before_image": updates_with_before,
         "mean_before_fields": _mean(before_width),
         "mean_after_fields": _mean(after_width),
     }

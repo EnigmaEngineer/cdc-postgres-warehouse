@@ -79,6 +79,15 @@ def check_summarise_counts_before_images():
     assert s["before_absent"] == 2, s
 
 
+def check_summarise_counts_updates_with_a_before_image_separately():
+    # before_present pools updates and deletes. Under the default replica identity every
+    # one of them is a delete, and that is the whole finding. Pooling hides it.
+    stream = [UPDATE_DEFAULT, UPDATE_FULL, DELETE_DEFAULT, DELETE_FULL]
+    s = decode.summarise(decode.parse_stream(stream))
+    assert s["before_present"] == 3
+    assert s["updates_with_before_image"] == 1, s
+
+
 def check_summarise_separates_tables():
     s = decode.summarise(decode.parse_stream([INSERT, UPDATE_DEFAULT, DELETE_DEFAULT]))
     assert s["by_table"]["shop.customer:INSERT"] == 1

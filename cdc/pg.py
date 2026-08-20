@@ -48,6 +48,22 @@ def peek_changes(cur, slot):
     return [r[0] for r in cur.fetchall()]
 
 
+def peek_binary_changes(cur, slot, publication, proto_version="1"):
+    """Message count and total bytes from a pgoutput slot.
+
+    The frames are not parsed here. The question this answers is whether the binary plugin
+    a real consumer reads carries the same extra data the readable one shows, and a byte
+    total answers that without a frame decoder.
+    """
+    cur.execute(
+        "select data from pg_logical_slot_peek_binary_changes(%s, null, null,"
+        " 'proto_version', %s, 'publication_names', %s)",
+        (slot, proto_version, publication),
+    )
+    rows = [bytes(r[0]) for r in cur.fetchall()]
+    return len(rows), sum(len(r) for r in rows)
+
+
 def set_replica_identity(cur, table, mode):
     if mode not in ("DEFAULT", "FULL", "NOTHING"):
         raise ValueError("replica identity must be DEFAULT, FULL or NOTHING, got " + repr(mode))
