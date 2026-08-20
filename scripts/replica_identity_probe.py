@@ -79,6 +79,9 @@ def run_arm(cur, schema_path, mode, seed, steps, customers, products):
     lines = pg.peek_changes(cur, SLOT)
     summary = decode.summarise(decode.parse_stream(lines))
     msgs, pgo_bytes = pg.peek_binary_changes(cur, SLOT_PGO, PUBLICATION)
+    # Read before the slots are dropped. Peek does not advance a slot, so this is what
+    # both slots are still pinning after the whole workload.
+    retention = pg.slot_retention(cur)
     pg.drop_slot_if_exists(cur, SLOT)
     pg.drop_slot_if_exists(cur, SLOT_PGO)
 
@@ -87,6 +90,7 @@ def run_arm(cur, schema_path, mode, seed, steps, customers, products):
         "summary": summary,
         "pgoutput_messages": msgs,
         "pgoutput_bytes": pgo_bytes,
+        "slot_retention": retention,
         "applied": applied,
         "skipped": skipped,
         "deflected": plan.deflected,
@@ -144,6 +148,7 @@ def main(argv=None):
             }
             for name, runs in sorted(passes.items())
         },
+        "slot_retention_after_default_arm": arms["default"]["slot_retention"],
         "applied": arms["default"]["applied"],
         "skipped": arms["default"]["skipped"],
         "deflected": arms["default"]["deflected"],

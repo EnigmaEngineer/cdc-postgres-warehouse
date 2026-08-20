@@ -64,6 +64,25 @@ def peek_binary_changes(cur, slot, publication, proto_version="1"):
     return len(rows), sum(len(r) for r in rows)
 
 
+def slot_retention(cur):
+    """What each slot is holding on to, in bytes.
+
+    An unconsumed slot is the thing that takes a Postgres source down. It pins the write
+    ahead log from its restart position forward, and the log then grows until the disk
+    fills. Nothing warns. The database is healthy right up until it is not.
+    """
+    cur.execute(
+        "select slot_name, plugin, active, wal_status,"
+        " pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint"
+        " from pg_replication_slots order by slot_name"
+    )
+    return [
+        {"slot": r[0], "plugin": r[1], "active": r[2], "wal_status": r[3],
+         "retained_bytes": int(r[4]) if r[4] is not None else None}
+        for r in cur.fetchall()
+    ]
+
+
 def set_replica_identity(cur, table, mode):
     if mode not in ("DEFAULT", "FULL", "NOTHING"):
         raise ValueError("replica identity must be DEFAULT, FULL or NOTHING, got " + repr(mode))

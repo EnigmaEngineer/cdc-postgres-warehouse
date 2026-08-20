@@ -48,21 +48,24 @@ nothing was deflected.
 
 | replica identity | updates carrying a before image | mean before fields | WAL bytes | WAL vs default | pgoutput bytes | pgoutput vs default |
 |---|---|---|---|---|---|---|
-| `DEFAULT` | 0 of 988 | 2.0 | 616,072 | 1.0 | 297,033 | 1.0 |
-| `FULL` | 988 of 988 | 5.6284 | 665,488 | 1.0802 | 386,708 | 1.3019 |
+| `DEFAULT` | 0 of 988 | 2.0 | 616,072 | 1.0 | 297,077 | 1.0 |
+| `FULL` | 988 of 988 | 5.6284 | 665,488 | 1.0802 | 386,657 | 1.3015 |
 | `NOTHING` | refused by the source | | | | | |
 
 Three things fall out of that.
 
 **The write ahead log ratio understates what the consumer pays by nearly four times.**
 Turning on full before images adds 8 percent to the write ahead log and 30 percent to the
-bytes the replication stream delivers. Those are the same rows. The gap is there because
-the log is already carrying the full page images, the transaction metadata and everything
-the other tables wrote, and the replication stream is carrying only the change. A capacity
-argument made off `pg_wal_lsn_diff` is an argument about disk, and the number that decides
-whether a consumer keeps up is the other one. The message count is identical at 6,844
-either way, so every one of those extra bytes is inside a message the consumer was already
-going to receive.
+bytes the replication stream delivers. Those are the same rows. The message count is
+identical at 6,844 either way, so every extra byte sits inside a message the consumer was
+always going to receive. A capacity argument made off `pg_wal_lsn_diff` is an argument
+about disk. The number that decides whether a consumer keeps up is the other one.
+
+I have not measured why the two ratios differ. The obvious candidate is that the log
+carries full page images and transaction metadata and every other write in the database,
+so the same extra tuple is a smaller fraction of a larger total. That is an explanation I
+find convincing and it is not a measurement, and decomposing the log by record type would
+settle it.
 
 **`NOTHING` is not a cheap option, it is not an option.** Postgres refuses the write. The
 error is `cannot update table "customer" because it does not have a replica identity and
@@ -82,13 +85,39 @@ between two settings is noise.
 
 | arm | decoded changes | WAL bytes | pgoutput bytes |
 |---|---|---|---|
-| `DEFAULT` | range 0 | range 208, 0.0338 percent | range 34, 0.0114 percent |
-| `FULL` | range 0 | range 24, 0.0036 percent | range 5, 0.0013 percent |
+| `DEFAULT` | range 0 | range 208, 0.0338 percent | range 58, 0.0195 percent |
+| `FULL` | range 0 | range 24, 0.0036 percent | range 156, 0.0403 percent |
 
 Decoded change counts reproduce exactly, both arms, every pass. Byte volumes do not. So a
 byte volume here is neither a counted quantity nor a timing, and it has a small floor under
-it. The floor is three orders of magnitude below the 1.3019 ratio, which is the only reason
-that ratio is worth stating.
+it. Two separate runs of the whole script gave a stream ratio of 1.3019 and 1.3015, so the
+third decimal is not worth reading and the first two are.
+
+## The failure mode nobody measures
+
+A replication slot that nobody consumes pins the write ahead log. That is the incident
+that takes a Postgres source down, and it is not a slow degradation. The disk fills and
+the database stops.
+
+The probe reads `pg_replication_slots` before dropping its slots, so the number is what
+the slots were really holding.
+
+```
+probe_slot            test_decoding  active=false  wal_status=reserved  retained 616,128 bytes
+probe_slot_pgoutput   pgoutput       active=false  wal_status=reserved  retained 616,128 bytes
+```
+
+The workload wrote 616,072 bytes of log. Each idle slot is pinning 616,128, which is all of
+it. Two slots hold the same log rather than two copies of it, so the cost of a second
+consumer is not a second copy. The cost of one consumer that stops reading is everything
+written since it stopped.
+
+`wal_status` is the column worth alerting on. It reads `reserved` on this instance, where
+`max_slot_wal_keep_size` is `-1`, which is the Postgres 14 default and means no limit. With
+no limit the slot never gives up and the disk is what runs out. Setting a limit trades that
+for a slot that can reach `lost` and need reseeding from a snapshot. I have measured the
+`reserved` state and the retained byte count. I have not run a source out of disk and I
+have not driven a slot to `lost`.
 
 ## Running the checks
 
