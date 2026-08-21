@@ -116,3 +116,50 @@ def _mean(xs):
     if not xs:
         return 0.0
     return round(sum(xs) / len(xs), 4)
+
+
+# The first byte of a pgoutput frame is its message type. This is the version 1 set and
+# it is deliberately not exhaustive, because an unknown byte has to come back as unknown
+# rather than as a guess.
+PGOUTPUT_TYPES = {
+    b"B": "begin",
+    b"C": "commit",
+    b"R": "relation",
+    b"I": "insert",
+    b"U": "update",
+    b"D": "delete",
+    b"T": "truncate",
+    b"O": "origin",
+    b"Y": "type",
+}
+
+
+def pgoutput_message_types(frames):
+    """Count the pgoutput frames by kind.
+
+    The reason this exists is that a publication covering one table still produces a
+    frame for every transaction on every table, because BEGIN and COMMIT are transaction
+    scoped and not table scoped. A message count on its own hides that, and the message
+    count is what somebody sizes a consumer from.
+    """
+    out = {}
+    for frame in frames:
+        if not frame:
+            out["empty"] = out.get("empty", 0) + 1
+            continue
+        name = PGOUTPUT_TYPES.get(frame[:1], "unknown:" + frame[:1].hex())
+        out[name] = out.get(name, 0) + 1
+    return out
+
+
+def row_change_share(counts):
+    """Fraction of frames that carry a row change rather than transaction framing.
+
+    Returns None on an empty stream. A share of zero and a share of nothing at all are
+    different answers and a caller has to be able to tell them apart.
+    """
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    changes = sum(counts.get(k, 0) for k in ("insert", "update", "delete", "truncate"))
+    return changes / total
