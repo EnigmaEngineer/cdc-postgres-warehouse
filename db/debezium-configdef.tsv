@@ -1,0 +1,113 @@
+# Configuration keys the Debezium Postgres connector really declares, read out of the jar
+# rather than out of the documentation. Four columns, tab separated. The name and the type
+# and the default and the importance. A default of NO_DEFAULT means the key has none.
+#
+# This file exists so that a connector config in this repo can be checked against the
+# connector instead of against somebody's memory of it. A key list written by hand is a
+# list of the properties its author happened to remember.
+#
+# Regenerate with scripts/dump_connector_configdef.sh, which needs a JDK and pulls the
+# connector plugin and the Kafka client jars from Maven. Nothing else in this repo needs
+# either, which is why the output is committed and the tool is a script.
+#
+# Source: io.debezium:debezium-connector-postgres:2.7.3.Final
+binary.handling.mode	STRING	bytes	LOW
+column.exclude.list	LIST	null	MEDIUM
+column.include.list	LIST	null	MEDIUM
+column.mask.hash.([^.]+).with.salt.(.+)	STRING	null	MEDIUM
+column.mask.with.(d+).chars	STRING	null	MEDIUM
+column.propagate.source.type	LIST	null	MEDIUM
+column.truncate.to.(d+).chars	INT	null	MEDIUM
+converters	STRING	null	LOW
+custom.metric.tags	LIST	null	LOW
+database.dbname	STRING	null	HIGH
+database.hostname	STRING	null	HIGH
+database.initial.statements	STRING	null	LOW
+database.password	PASSWORD	null	HIGH
+database.port	INT	5432	HIGH
+database.query.timeout.ms	INT	600000	LOW
+database.sslcert	STRING	null	MEDIUM
+database.sslfactory	STRING	null	MEDIUM
+database.sslkey	STRING	null	MEDIUM
+database.sslmode	STRING	prefer	MEDIUM
+database.sslpassword	PASSWORD	null	MEDIUM
+database.sslrootcert	STRING	null	MEDIUM
+database.tcpKeepAlive	BOOLEAN	true	MEDIUM
+database.user	STRING	null	HIGH
+datatype.propagate.source.type	LIST	null	MEDIUM
+decimal.handling.mode	STRING	precise	MEDIUM
+errors.max.retries	INT	-1	LOW
+event.processing.failure.handling.mode	STRING	fail	MEDIUM
+flush.lsn.source	BOOLEAN	true	LOW
+heartbeat.action.query	STRING	null	LOW
+heartbeat.interval.ms	INT	0	MEDIUM
+heartbeat.topics.prefix	STRING	__debezium-heartbeat	LOW
+hstore.handling.mode	STRING	json	LOW
+include.schema.comments	BOOLEAN	false	MEDIUM
+include.unknown.datatypes	BOOLEAN	false	MEDIUM
+incremental.snapshot.chunk.size	INT	1024	MEDIUM
+incremental.snapshot.watermarking.strategy	STRING	INSERT_INSERT	LOW
+internal.log.position.check.enable	BOOLEAN	true	MEDIUM
+internal.snapshot.scan.all.columns.force	BOOLEAN	false	LOW
+interval.handling.mode	STRING	numeric	LOW
+max.batch.size	INT	2048	MEDIUM
+max.queue.size	INT	8192	MEDIUM
+max.queue.size.in.bytes	LONG	0	MEDIUM
+message.key.columns	STRING	null	MEDIUM
+message.prefix.exclude.list	LIST	null	MEDIUM
+message.prefix.include.list	LIST	null	MEDIUM
+notification.enabled.channels	LIST	null	MEDIUM
+notification.sink.topic.name	STRING	null	HIGH
+plugin.name	STRING	decoderbufs	MEDIUM
+poll.interval.ms	LONG	500	MEDIUM
+post.processors	STRING	null	LOW
+provide.transaction.metadata	BOOLEAN	false	LOW
+publication.autocreate.mode	STRING	all_tables	MEDIUM
+publication.name	STRING	dbz_publication	MEDIUM
+query.fetch.size	INT	0	MEDIUM
+replica.identity.autoset.values	STRING	null	MEDIUM
+retriable.restart.connector.wait.ms	LONG	10000	LOW
+schema.exclude.list	LIST	null	MEDIUM
+schema.include.list	LIST	null	HIGH
+schema.name.adjustment.mode	STRING	none	LOW
+schema.refresh.mode	STRING	columns_diff	MEDIUM
+signal.data.collection	STRING	null	MEDIUM
+signal.enabled.channels	LIST	[source]	MEDIUM
+signal.poll.interval.ms	LONG	5000	MEDIUM
+skipped.operations	LIST	[t]	LOW
+slot.drop.on.stop	BOOLEAN	false	MEDIUM
+slot.max.retries	INT	6	LOW
+slot.name	STRING	debezium	MEDIUM
+slot.retry.delay.ms	LONG	10000	LOW
+slot.stream.params	STRING	null	LOW
+snapshot.delay.ms	LONG	0	LOW
+snapshot.fetch.size	INT	null	MEDIUM
+snapshot.include.collection.list	LIST	null	MEDIUM
+snapshot.lock.timeout.ms	LONG	10000	MEDIUM
+snapshot.locking.mode	STRING	none	LOW
+snapshot.locking.mode.custom.name	STRING	null	MEDIUM
+snapshot.max.threads	INT	1	MEDIUM
+snapshot.mode	STRING	initial	MEDIUM
+snapshot.mode.configuration.based.snapshot.data	BOOLEAN	false	MEDIUM
+snapshot.mode.configuration.based.snapshot.on.data.error	BOOLEAN	false	MEDIUM
+snapshot.mode.configuration.based.snapshot.on.schema.error	BOOLEAN	false	MEDIUM
+snapshot.mode.configuration.based.snapshot.schema	BOOLEAN	false	MEDIUM
+snapshot.mode.configuration.based.start.stream	BOOLEAN	false	MEDIUM
+snapshot.mode.custom.name	STRING	null	MEDIUM
+snapshot.query.mode	STRING	select_all	LOW
+snapshot.query.mode.custom.name	STRING	null	MEDIUM
+snapshot.select.statement.overrides	STRING	null	MEDIUM
+snapshot.tables.order.by.row.count	STRING	disabled	MEDIUM
+sourceinfo.struct.maker	CLASS	class io.debezium.connector.postgresql.PostgresSourceInfoStructMaker	LOW
+status.update.interval.ms	INT	10000	MEDIUM
+streaming.delay.ms	LONG	0	LOW
+table.exclude.list	LIST	null	MEDIUM
+table.ignore.builtin	BOOLEAN	true	LOW
+table.include.list	LIST	null	HIGH
+time.precision.mode	STRING	adaptive	MEDIUM
+tombstones.on.delete	BOOLEAN	true	MEDIUM
+topic.naming.strategy	CLASS	class io.debezium.schema.SchemaTopicNamingStrategy	MEDIUM
+topic.prefix	STRING	null	HIGH
+transaction.metadata.factory	CLASS	class io.debezium.pipeline.txmetadata.DefaultTransactionMetadataFactory	LOW
+unavailable.value.placeholder	STRING	__debezium_unavailable_value	MEDIUM
+xmin.fetch.interval.ms	LONG	0	MEDIUM
