@@ -23,17 +23,108 @@ tested of the two.
         v
   Postgres 14, wal_level=logical
         |
-        |  logical replication slot, publication cdc_shop
+        |  one logical replication slot, publication cdc_shop
         v
   cdc/decode.py              reads what the slot really emitted
         |
         v
-  cdc/probe.py               turns two measured arms into a claim
+  cdc/connector.py           the Debezium config, generated from the catalog
+  cdc/topics.py              topic names, keys, and the Kafka partitioner
+        |
+        v
+  shopcdc.shop.customer      shopcdc.shop.order_header
+  shopcdc.shop.product       shopcdc.shop.order_item
 ```
 
-Kafka, Kafka Connect and Debezium belong in this stack and none of them are here yet.
+Kafka and Kafka Connect are not running here yet. The connector config is generated and
+validated against the real connector rather than pasted from a tutorial, and the topic
+layout decision is measured on the source side, which is where its cost actually lands.
 `docker-compose.yml` carries one service for that reason. A compose file listing services
 that nothing in the repo ever contacts is an architecture claim the code cannot back.
+
+## The topic layout, and why it is one connector
+
+Debezium puts one table on one topic and the obvious next thought is to run one connector
+per table, so a slow table cannot hold up a fast one. On the Kafka side that is fine. On
+the Postgres side it is not, and the reason is that a `pgoutput` stream carries a frame
+per transaction boundary as well as a frame per row change, and the boundary frames are
+not filtered by the publication.
+
+One workload from an empty schema, 280 dimension rows and then 600 operations. One slot on
+the four table publication against four slots each on a one table publication, all five
+reading the same log.
+
+```
+python -m scripts.topic_layout_probe --steps 600 --seed 11 --passes 1 --markdown
+```
+
+| | frames | of which framing | of which row changes | row change share |
+|---|---|---|---|---|
+| one connector, 4 tables | 2,652 | 1,772 | 880 | 0.3318 |
+| `shop.customer` alone | 2,026 | 1,767 | 259 | 0.1278 |
+| `shop.product` alone | 1,910 | 1,765 | 145 | 0.0759 |
+| `shop.order_header` alone | 1,962 | 1,763 | 199 | 0.1014 |
+| `shop.order_item` alone | 2,038 | 1,761 | 277 | 0.1359 |
+| **four connectors, totalled** | **7,936** | **7,056** | **880** | 0.1109 |
+
+Splitting four ways delivers exactly the same 880 row changes and reads 3.98 times the
+transaction framing to do it. Every connector sees a BEGIN and a COMMIT for every
+transaction in the database, including the ones that touch nothing it publishes. The
+`shop.product` connector reads 1,765 framing frames to deliver 145 row changes.
+
+So the layout here is one connector on one slot reading one publication. Debezium routes
+to four topics itself. That is also its default, and the point is that the default is now
+a measurement rather than an assumption.
+
+The counts reproduce exactly. Across three passes every frame count and the 3.9819
+multiple had a range of zero. The stream byte total moved by 54 bytes at 0.045 percent and
+the write ahead log volume by 208 bytes at 0.089 percent. Those are three kinds of
+quantity and only the first is allowed to carry a claim without its spread beside it.
+
+### The key is where the ordering story breaks
+
+Debezium keys a record by the table's primary key, and `shop.order_item` has a composite
+one. So the lines of an order are hashed independently and land wherever they land.
+
+```
+python -m scripts.topic_layout_probe --steps 4000 --seed 11 --passes 1
+```
+
+Measured over the 482 `order_item` rows that workload leaves behind, at 6 partitions,
+using the Kafka Java client's own partitioner. Of 296 orders, 122 had more than one line,
+and **104 of those 122 were spread across more than one partition**. That is 85.2 percent.
+Setting `message.key.columns` to `shop.order_item:order_id` takes it to 0 of 122.
+
+Orders with a single line are excluded from the denominator, because a group of one row
+cannot split and counting it would report a smaller rate for a reason that has nothing to
+do with partitioning.
+
+That is not a free fix and the README should not pretend it is. Keying on `order_id`
+alone means two lines of one order share a key, so log compaction would keep only the
+last one and a tombstone for a deleted line would delete the wrong thing. The choice is
+per order ordering or per row compaction, and this repo has not made it yet.
+
+The partitioner is a port. `scripts/dump_connector_configdef.sh` regenerates the vectors
+in `tests/test_topics.py` from `org.apache.kafka.common.utils.Utils.murmur2` directly,
+and 220 keys were compared against the real client with no mismatches.
+
+## Three defaults that are wrong here
+
+`cdc/connector.py` refuses to emit a config that leaves any of these alone, and
+`tests/test_connector.py` asserts that each one really is the shipped default by reading
+`db/debezium-configdef.tsv`, which is dumped out of the connector jar. A note about a
+default that has changed is worse than no note.
+
+| property | ships as | measured |
+|---|---|---|
+| `plugin.name` | `decoderbufs` | not available. `pg_create_logical_replication_slot` returns `library "decoderbufs" may not be used as an output plugin`. `wal2json` fails the same way. `pgoutput` and `test_decoding` are accepted. |
+| `publication.autocreate.mode` | `all_tables` | would replace an explicit four table publication with one covering the whole database, and needs ownership of every table in it |
+| `slot.name` | `debezium` | one fixed string for every connector. A second connector gets `replication slot "debezium" already exists`. |
+
+The first two are the ones that matter. A misspelled property is accepted and ignored by
+Kafka Connect, so the validator checks every key against the 100 the connector really
+declares, and the first check in the suite is a list of legitimate properties it must not
+refuse.
 
 ## The first thing worth knowing
 
@@ -119,26 +210,76 @@ for a slot that can reach `lost` and need reseeding from a snapshot. I have meas
 `reserved` state and the retained byte count. I have not run a source out of disk and I
 have not driven a slot to `lost`.
 
+### Reading the whole stream is not what releases it
+
+This is the part I had wrong. A slot carries two positions and they are not the same
+thing. `confirmed_flush_lsn` is how far the consumer says it has read.  `restart_lsn` is
+how far back the server still has to keep the log. Only the second one is retention.
+
+One connector slot, followed through a workload. From
+`scripts/topic_layout_probe.py`, the `positions` block.
+
+| after | retained bytes | unconfirmed bytes |
+|---|---|---|
+| the workload, nothing read | 240,072 | 240,016 |
+| reading the entire stream | 238,368 | 0 |
+| reading everything, all five slots | 238,368 | 0 |
+| a `CHECKPOINT` | 238,672 | 304 |
+| a `CHECKPOINT` and then one more read | **176** | 0 |
+
+The consumer reached the end of the stream and 238,368 bytes stayed pinned. A checkpoint
+on its own did not release them either, and moved the number up by 304 bytes because a
+checkpoint writes log of its own. Only a checkpoint followed by another read dropped it to
+176 bytes.
+
+So a monitor watching consumer lag reports a healthy consumer while the disk fills. The
+restart position is recalculated from a running transactions record, which the server
+writes at a checkpoint, and that record has to be decoded before the slot moves. Two
+things have to happen and neither of them is the one people name. On a quiet source both
+can be a long way off, which is what `heartbeat.interval.ms` in the connector config is
+for.
+
+The byte figures move between passes and no ratio here is built on them. Across three
+passes the write ahead log volume ranged 208 bytes at 0.089 percent while every frame
+count had a range of zero. What reproduces is the shape of the table.
+
 ## Running the checks
 
 ```
 python tests/run_all.py
 ```
 
-48 checks, no database required. The workload planner, the decoded change reader, the
-schema and the comparison arithmetic all run on fixtures. `tests/test_decode.py` uses real
-`test_decoding` output copied off a running server rather than lines written from memory,
-because a parser tested against invented input tests the author's memory of a format.
+85 checks, no database required. Everything runs on fixtures. The workload planner and the
+decoded change reader and the schema, and then the connector config and the partitioner.
+`tests/test_decode.py` uses real `test_decoding` output copied off a running server rather
+than lines written from memory, because a parser tested against invented input tests the
+author's memory of a format.
+
+`tests/test_topics.py` pins the murmur2 port against vectors taken from
+`org.apache.kafka.common.utils.Utils.murmur2`. Three of them have the sign bit set,
+because that is the only input where masking and taking an absolute value disagree and
+every other vector leaves the rule untested.
+
+`tests/test_connector.py` opens with a list of legitimate Debezium properties the
+validator must not refuse. A guardrail is judged first on what it wrongly blocks, because
+one that refuses real configs gets switched off and then it protects nothing.
 
 `tests/test_schema.py` reads `db/schema.sql` and fails when a table is declared and not
 published. Postgres 14 has no `FOR ALL TABLES IN SCHEMA`, so the publication names its
 tables one by one. Adding a table and forgetting the publication does not error and does
 not warn. It just never appears in the change stream.
 
-Eight mutants were run against the shipped code and all eight were killed, with a clean
-control before and after. The one worth naming took the delete tuple and reported it as an
-after image rather than a before image, which is a plausible reading of the plugin output
-and would have made every delete look like an insert of a two column row.
+Mutants are run against the shipped code every time it changes, with a clean control
+before and after. The one worth naming took the delete tuple and reported it as an after
+image rather than a before image, which is a plausible reading of the plugin output and
+would have made every delete look like an insert of a two column row.
+
+Two survivors from the latest pass are worth naming too, because both were real gaps and
+both are the same shape. A mutant dropping `delete` from the row kind list survived
+because the fixture beside it had only inserts and updates in it. A mutant deleting the
+column count guard in the config loader survived because unpacking a two element list
+into four names raises `ValueError` by itself, so a check asserting the type passes
+whether the guard is there or not. That check now asserts the message.
 
 `tests/test_deps.py` walks every `.py` file with `ast` and fails when a third party import
 is missing from `requirements.txt`, or when `requirements.txt` declares something nothing
@@ -149,6 +290,25 @@ the repo is correct would do the same thing if it were scanning nothing.
 
 - **The consumer does not exist yet.** Nothing reads the slot except a measurement. The
   merge, the ordering guarantees and the reconciliation are the work ahead.
+- **No Kafka Connect worker has ever run this connector config.** It is generated from
+  the catalog and validated against the key list dumped out of the connector jar, which
+  catches a misspelled property and a dangerous default. It does not catch a value the
+  connector accepts and then rejects at runtime, and nothing here has posted it to a REST
+  endpoint. `scripts/dump_connector_configdef.sh` is the only thing in this repo that has
+  loaded the connector class at all.
+- **The topic layout figures are frame counts, not throughput.** Four connectors read
+  3.98 times the transaction framing. Whether that costs a real source anything depends
+  on decoding cost per frame, which is not measured here. The framing frames are small.
+  The argument for one connector is that the extra work buys nothing, not that it is
+  expensive.
+- **The composite key split rate is measured at 6 partitions on one table.** It is a
+  property of the partition count and the key, and 6 was chosen rather than measured. A
+  different count moves the number and not the conclusion. A shorter workload of 600
+  operations gives 18 of 20 rather than 104 of 122, and 20 splittable orders is too few to
+  read a rate off.
+- **The retention table is one slot's positions through one workload.** The order of
+  operations in it was chosen after the first run came back flat, so it is a sequence
+  built to expose a specific behaviour rather than a trace of a real deployment.
 - **The database plumbing in `scripts/replica_identity_probe.py` has no tests.** The
   arithmetic it prints comes from `cdc/probe.py` and `cdc/decode.py`, which do. The part
   that opens a connection and resets a schema does not.
