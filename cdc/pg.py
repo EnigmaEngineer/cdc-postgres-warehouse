@@ -48,6 +48,21 @@ def peek_changes(cur, slot):
     return [r[0] for r in cur.fetchall()]
 
 
+def peek_changes_with_lsn(cur, slot):
+    """Every change with the log position it sits at, as a number.
+
+    The position arrives as '0/1A2B3C4D' text and that does not sort correctly as a string
+    once either half changes width. pg_wal_lsn_diff against the origin turns it into bytes,
+    which is the quantity a consumer's ordering rule compares.
+    """
+    cur.execute(
+        "select pg_wal_lsn_diff(lsn, '0/0')::bigint, data"
+        " from pg_logical_slot_peek_changes(%s, null, null)",
+        (slot,),
+    )
+    return [(int(r[0]), r[1]) for r in cur.fetchall()]
+
+
 def peek_binary_changes(cur, slot, publication, proto_version="1"):
     """Message count and total bytes from a pgoutput slot.
 
