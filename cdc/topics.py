@@ -197,21 +197,3 @@ def split_cost(single, per_connector):
     }
 
 
-def layout(prefix, tables, partitions):
-    """The whole topic layout as data, so a test can read it and a README can print it.
-
-    tables is an ordered mapping of (schema, table) to the primary key columns.
-    """
-    if partitions < 1:
-        raise ValueError("partitions must be at least 1, got {}".format(partitions))
-    out = []
-    for (schema, table), key_columns in tables.items():
-        out.append({
-            "schema": schema,
-            "table": table,
-            "topic": topic_name(prefix, schema, table),
-            "key_columns": list(key_columns),
-            "partitions": partitions,
-            "composite_key": len(key_columns) > 1,
-        })
-    return out

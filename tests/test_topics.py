@@ -128,15 +128,6 @@ def check_routing_on_the_group_column_cannot_split_a_group():
     assert composite["split"] > 0, composite
 
 
-def check_layout_marks_the_composite_key():
-    tables = {("shop", "customer"): ("customer_id",),
-              ("shop", "order_item"): ("order_id", "line_no")}
-    rows = {r["table"]: r for r in topics.layout("shopcdc", tables, 6)}
-    assert rows["customer"]["composite_key"] is False
-    assert rows["order_item"]["composite_key"] is True
-    assert rows["order_item"]["key_columns"] == ["order_id", "line_no"]
-
-
 def check_split_cost_counts_framing_separately_from_rows():
     # Every row kind appears here on purpose. A fixture carrying inserts and updates only
     # cannot notice a row kind dropped from the tally, and the real stream has deletes in

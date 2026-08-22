@@ -1,9 +1,9 @@
 # cdc-postgres-warehouse
 
 Change data capture from Postgres into a warehouse, built so that a rerun can never
-duplicate a row. This is the source side. A Postgres instance with logical decoding turned
-on, an OLTP schema that produces the change shapes a consumer has to handle, and a seeded
-load generator that drives it.
+duplicate a row. A Postgres instance with logical decoding turned on and an OLTP schema
+that produces the change shapes a consumer has to handle. A seeded load generator drives
+it. A consumer applies the result and is graded against the source table.
 
 ```
 ./scripts/bootstrap-local.sh
@@ -30,15 +30,21 @@ tested of the two.
         v
   cdc/connector.py           the Debezium config, generated from the catalog
   cdc/topics.py              topic names, keys, and the Kafka partitioner
+  cdc/events.py              the envelope, and the tombstone behind every delete
         |
         v
   shopcdc.shop.customer      shopcdc.shop.order_header
   shopcdc.shop.product       shopcdc.shop.order_item
+        |
+        |  cdc/delivery.py   routing, interleaving, compaction
+        v
+  cdc/consumer.py            apply, ordered by log position, keyed by primary key
 ```
 
 Kafka and Kafka Connect are not running here yet. The connector config is generated and
-validated against the real connector rather than pasted from a tutorial, and the topic
-layout decision is measured on the source side, which is where its cost actually lands.
+validated against the real connector rather than pasted from a tutorial. The topic layout
+decision is measured on the source side, where its cost actually lands. The consumer is fed
+the records a topic would carry, routed by Kafka's own partitioner.
 `docker-compose.yml` carries one service for that reason. A compose file listing services
 that nothing in the repo ever contacts is an architecture claim the code cannot back.
 
@@ -99,14 +105,122 @@ Orders with a single line are excluded from the denominator, because a group of 
 cannot split and counting it would report a smaller rate for a reason that has nothing to
 do with partitioning.
 
-That is not a free fix and the README should not pretend it is. Keying on `order_id`
-alone means two lines of one order share a key, so log compaction would keep only the
-last one and a tombstone for a deleted line would delete the wrong thing. The choice is
-per order ordering or per row compaction, and this repo has not made it yet.
+That is not a free fix. Keying on `order_id` alone means two lines of one order share a
+record key, and a tombstone names a record key. The next section runs both keys through the
+consumer, and the 85.2 percent turns out to cost nothing.
 
 The partitioner is a port. `scripts/dump_connector_configdef.sh` regenerates the vectors
 in `tests/test_topics.py` from `org.apache.kafka.common.utils.Utils.murmur2` directly,
 and 220 keys were compared against the real client with no mismatches.
+
+## The consumer, and the ordering it actually needs
+
+The 85.2 percent looks like a problem. It is not one, and the reason is that a merge and a
+broker want different things.
+
+A merge needs two changes to one row to arrive in the order they happened. Kafka promises
+exactly that and nothing more. Two records under one key land on one partition, so they
+arrive in order. Records under different keys have no relation at all.
+
+`shop.order_item`'s primary key is `(order_id, line_no)`, so every change to one line
+already carries the same key. The merge has the guarantee it needs. Wanting the lines of an
+order together is a different wish and the merge never had it.
+
+So the choice gets measured. One change stream out of one slot, read eight ways, under both
+keys.
+
+```
+python -m scripts.consumer_probe --steps 4000 --seed 11 --partitions 6 --markdown
+```
+
+4,280 row changes over 12,840 decoded lines, each one at its own log position. 1,626
+inserts, 2,004 updates and 370 deletes on top of 280 seeded dimension rows. Every delete is
+followed by a tombstone, so the topics carry 4,650 records. The source is left holding 482
+`order_item` rows and every applied row is compared against it column by column, timestamps
+included.
+
+`row` key, 0 of 1777 record keys carry more than one row
+
+| delivery | order_item rows | missing | extra | all four tables |
+|---|---|---|---|---|
+| `log_order` | 482 | 0 | 0 | exact |
+| `interleaved` | 482 | 0 | 0 | exact |
+| `interleaved_open` | 482 | 0 | 0 | exact |
+| `compacted` | 482 | 0 | 0 | exact |
+| `interleaved_tombstone_ignored` | 482 | 0 | 0 | exact |
+| `interleaved_key_as_row` | 482 | 0 | 0 | exact |
+| `shuffled` | 445 | 37 | 0 | **wrong** |
+| `shuffled_open` | 561 | 128 | 207 | **wrong** |
+
+`order` key, 188 of 1415 record keys carry more than one row
+
+| delivery | order_item rows | missing | extra | all four tables |
+|---|---|---|---|---|
+| `log_order` | 381 | 101 | 0 | **wrong** |
+| `interleaved` | 381 | 101 | 0 | **wrong** |
+| `interleaved_open` | 381 | 101 | 0 | **wrong** |
+| `compacted` | 258 | 224 | 0 | **wrong** |
+| `interleaved_tombstone_ignored` | 482 | 0 | 0 | exact |
+| `interleaved_key_as_row` | 258 | 224 | 0 | **wrong** |
+| `shuffled` | 330 | 152 | 0 | **wrong** |
+| `shuffled_open` | 458 | 199 | 175 | **wrong** |
+
+**Under the default key every delivery order Kafka can produce is exact.** All four tables,
+every row, including the compacted arm. The 104 orders spread across partitions cost
+nothing, because nothing downstream ever needed them together.
+
+**Under `order_id` the fix loses 101 of 482 rows in perfect log order.** Not under an
+awkward interleaving. In the log's own order. A tombstone carries a record key and no
+value, so a tombstone for one deleted line names every line of that order, and 285 live
+rows are removed by tombstones over the run.
+
+Ignoring the tombstone recovers all 482. That arm is exact, and it is exact because the
+delete envelope in front of the tombstone still carries `line_no` under the default replica
+identity, so the consumer can name the row without help. Which leaves the position that
+`order_id` keying really requires. Keep the co-location, throw away the tombstone, and
+accept that a compacted topic then loses 224 of 482.
+
+So it is not a tradeoff between per order ordering and per row compaction. Per order
+ordering buys nothing the merge wanted, and it costs the mechanism that lets the topic
+forget a deleted row. **The layout stays on Debezium's default key.**
+
+### The record key is not the merge key
+
+`interleaved_key_as_row` is the same consumer with one shortcut in it. Instead of merging
+on the source primary key it keys its target by the record key, which is what everyone
+writes first because Debezium makes the two the same by default.
+
+Under the default key that shortcut is invisible. It scores 482 of 482. Move one table off
+its primary key and it loses 224 rows, and the two lines it silently merged were never
+deleted by anyone. `cdc/consumer.py` therefore takes the merge key as an argument and the
+record key comes off the record.
+
+### The ordering guard does no work here, and that is the finding
+
+The consumer drops any change older than the position its key already holds. That guard
+fires zero times.
+
+| key | delivery | pairs out of order | under one key | dropped as stale |
+|---|---|---|---|---|
+| `row` | `log_order` | 0 | 0 | 0 |
+| `row` | `interleaved` | 421,968 | 0 | 0 |
+| `row` | `shuffled` | 5,455,467 | 3,472 | 1,606 |
+| `order` | `log_order` | 0 | 0 | 0 |
+| `order` | `interleaved` | 227,216 | 0 | 0 |
+| `order` | `shuffled` | 5,455,467 | 8,261 | 1,606 |
+
+The interleaved arm scrambles 421,968 pairs and not one of them is a pair under the same
+key. That is the broker guarantee written as a number, and it is why the guard cannot fire.
+A firing count of zero measured on that arm says nothing about whether the guard works.
+
+The shuffle arm is the one that exercises it. It breaks 3,472 same key pairs, which Kafka
+never does, and there the guard is worth 207 wrong rows. Removing it takes the target from
+445 rows with none wrong to 561 rows with 207 that should not be there.
+
+I am keeping it. It costs one comparison per record and it is the difference between a
+consumer that is correct and one that is correct as long as nobody widens a partition, adds
+a second writer, or replays a topic out of a snapshot. But calling it tested by the
+interleaved arms would be a claim about an arm that cannot fail.
 
 ## Three defaults that are wrong here
 
@@ -249,11 +363,16 @@ count had a range of zero. What reproduces is the shape of the table.
 python tests/run_all.py
 ```
 
-85 checks, no database required. Everything runs on fixtures. The workload planner and the
-decoded change reader and the schema, and then the connector config and the partitioner.
+146 checks, no database required. Everything runs on fixtures. The workload planner and the
+decoded change reader and the schema, then the connector config and the partitioner, then
+the record shape and the delivery orders and the apply rules.
 `tests/test_decode.py` uses real `test_decoding` output copied off a running server rather
 than lines written from memory, because a parser tested against invented input tests the
 author's memory of a format.
+
+`tests/test_consumer.py` and `tests/test_delivery.py` build a fixture where two rows share
+a record key. A fixture where every key covers one row turns every rule about tombstones
+green without running any of them, and there are four such rules.
 
 `tests/test_topics.py` pins the murmur2 port against vectors taken from
 `org.apache.kafka.common.utils.Utils.murmur2`. Three of them have the sign bit set,
@@ -274,12 +393,27 @@ before and after. The one worth naming took the delete tuple and reported it as 
 image rather than a before image, which is a plausible reading of the plugin output and
 would have made every delete look like an insert of a two column row.
 
-Two survivors from the latest pass are worth naming too, because both were real gaps and
-both are the same shape. A mutant dropping `delete` from the row kind list survived
-because the fixture beside it had only inserts and updates in it. A mutant deleting the
-column count guard in the config loader survived because unpacking a two element list
-into four names raises `ValueError` by itself, so a check asserting the type passes
-whether the guard is there or not. That check now asserts the message.
+The latest pass is 26 mutants over the apply rules and the delivery orders and the record
+shape, and the four that survived the first attempt are worth more than the twenty two that
+died.
+
+One was dead code. Taking the high water mark to `max(held, incoming)` cannot change
+anything, because the guard already dropped everything below the mark. A line no mutation
+can reach is a line doing nothing, and it was deleted rather than tested.
+
+One was a symmetric fixture. `compare` was checked with one missing row against one extra
+row, so swapping the two subtractions passed. It is two against one now, and missing
+against extra is exactly the difference between a merge that loses rows and one that keeps
+dead ones.
+
+One was a guard rescued by another module. `route` refuses a zero partition count, and so
+does the partitioner underneath it, with the same exception and a message containing the
+same words. The check only proves anything when it is handed an empty record list, because
+then the partitioner is never called and only `route` can refuse.
+
+One was a rule that only ran on keys carrying three records or more, and every fixture key
+that mattered carried three, because a delete brings a tombstone with it. There is now a
+key with exactly two.
 
 `tests/test_deps.py` walks every `.py` file with `ast` and fails when a third party import
 is missing from `requirements.txt`, or when `requirements.txt` declares something nothing
@@ -288,8 +422,27 @@ the repo is correct would do the same thing if it were scanning nothing.
 
 ## Known limitations
 
-- **The consumer does not exist yet.** Nothing reads the slot except a measurement. The
-  merge, the ordering guarantees and the reconciliation are the work ahead.
+- **The consumer applies to a dictionary, not to a warehouse.** The rules are real and the
+  target is memory. The same rules written as a MERGE, and the reconciliation that checks
+  them, are the work ahead.
+- **The consumer has never read a Kafka topic.** It reads a change stream out of a
+  replication slot and the records are built here rather than by a connector. The routing
+  and the interleaving are models of what a topic would deliver, using Kafka's own
+  partitioner. Nothing has consumed from a broker.
+- **The shuffle arm is not something Kafka does.** It is the only arm where the ordering
+  guard has anything to do, and its numbers describe a delivery model this system does not
+  have. The guard is kept on an argument about future shapes rather than on a measured need.
+- **The high water mark is never forgotten.** A key that has been deleted keeps its
+  position so a delayed insert cannot bring it back, and nothing expires the entry. On a
+  long lived stream that grows without limit. The window it really needs is a function of
+  how far out of order records can arrive, which is not measured here.
+- **No change in this workload moves a primary key.** A primary key update is a delete and
+  an insert under two different keys, so they land on two partitions and can be reordered
+  against each other. That is the case where the guard would earn its place on a real
+  topic, and the load generator does not produce one.
+- **The measured stream is `test_decoding`, not `pgoutput`.** The two carry the same
+  information about what is present and absent. A real connector reads the binary one and
+  the record shapes here are built from the readable one.
 - **No Kafka Connect worker has ever run this connector config.** It is generated from
   the catalog and validated against the key list dumped out of the connector jar, which
   catches a misspelled property and a dangerous default. It does not catch a value the
@@ -317,9 +470,11 @@ the repo is correct would do the same thing if it were scanning nothing.
   `pg_ctl` leaves a daemon running and this does not apply.
 - **`docker-compose.yml` has never run.** There is no Docker daemon on the machine this
   was written on. It is written from the Postgres image documentation and not from a run.
-- **The field counter in `cdc/decode.py` counts `name[type]:` runs.** A text value that
-  contains one inflates the count. Nothing written here produces such a value and
-  `tests/test_decode.py` pins the behaviour so the limit fails loudly if the parser moves.
+- **`cdc/decode.py` still splits a full update on the literal `new-tuple:`.** A text value
+  carrying that string would split the change in the wrong place. The field counting
+  version of this limit is gone, because reading values means finding where a value ends,
+  and the scanner now skips a quoted run whole. That check used to pin the wrong count at
+  2 and now asserts the right one at 1.
 - **The probe loads the schema by handing the whole file to `cur.execute`.** That works
   because `db/schema.sql` is plain SQL. A file carrying a psql meta-command would break it,
   and the failure would look like a syntax error in the schema rather than in the loader.

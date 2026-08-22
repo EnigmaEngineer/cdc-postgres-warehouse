@@ -341,14 +341,12 @@ def main():
             drop_probe_objects(cur)
         con.close()
 
-    tables = {(s, t): keys["{}.{}".format(s, t)] for s, t in published}
     report = {
         "plugins": plugins,
         "slot_names": slot_names,
         "passes": passes,
         "spread": spread(passes),
         "key_split": key_split,
-        "layout": topics.layout(args.prefix, tables, args.partitions),
         "publication": {"name": "cdc_shop", "tables": [list(t) for t in published],
                         "primary_keys": keys},
     }
