@@ -102,10 +102,73 @@ def check_field_counting_is_not_fooled_by_a_value_containing_a_colon():
     assert len(c.after) == 3, c.after
 
 
-def check_the_known_limit_of_field_counting_is_pinned():
-    # A text value that itself contains name[type]: does inflate the count. Nothing this
-    # repo writes produces one. Pinning it here means the limit is documented by a
-    # failing assertion the day someone changes the parser, rather than by a comment.
+def check_a_value_that_looks_like_a_field_no_longer_inflates_the_count():
+    # This check used to assert the opposite. The counter matched name[type]: anywhere in
+    # the fragment, so a text value carrying that shape was read as a second field, and the
+    # limit was pinned at 2 rather than fixed. Reading values meant reading where a value
+    # ends, and once the scanner does that the quoted run is skipped whole.
     line = "table shop.customer: INSERT: full_name[text]:'a weird[thing]:value'"
     c = decode.parse_change(line)
-    assert len(c.after) == 2, "the naive count is known to be 2 here, not 1"
+    assert len(c.after) == 1, c.after
+    assert decode.parse_row(line).after == {"full_name": "a weird[thing]:value"}
+
+
+def check_values_come_back_with_the_quotes_taken_off():
+    r = decode.parse_row(INSERT)
+    assert r.table == "shop.customer"
+    assert r.before is None
+    assert r.after["customer_id"] == "1"
+    assert r.after["email"] == "a@b.c"
+    assert r.after["full_name"] == "User 1"
+
+
+def check_a_value_can_contain_a_space_and_a_colon():
+    line = ("table shop.customer: INSERT: customer_id[bigint]:1 "
+            "full_name[text]:'Smith: the second' country[character]:'GB'")
+    r = decode.parse_row(line)
+    assert r.after["full_name"] == "Smith: the second", r.after
+    assert r.after["country"] == "GB"
+
+
+def check_a_doubled_quote_is_one_quote():
+    # Postgres writes O'Brien as 'O''Brien'. A reader that stops at the first quote
+    # truncates the name and then the next field name is read out of the remainder.
+    line = "table shop.customer: INSERT: full_name[text]:'O''Brien' country[character]:'IE'"
+    r = decode.parse_row(line)
+    assert r.after["full_name"] == "O'Brien", r.after
+    assert r.after["country"] == "IE", r.after
+
+
+def check_null_is_none_and_not_the_word():
+    line = "table shop.customer: INSERT: customer_id[bigint]:1 country[character]:null"
+    r = decode.parse_row(line)
+    assert r.after["country"] is None
+    assert "country" in r.after
+
+
+def check_an_unterminated_quote_is_an_error_and_not_a_short_value():
+    line = "table shop.customer: INSERT: full_name[text]:'never closed"
+    try:
+        decode.parse_row(line)
+    except ValueError as exc:
+        assert "unterminated" in str(exc), exc
+    else:
+        raise AssertionError("a truncated line came back as if it were whole")
+
+
+def check_a_full_update_splits_values_the_same_way_it_splits_names():
+    r = decode.parse_row(UPDATE_FULL)
+    assert r.before["price_cents"] == "1900", r.before
+    assert r.after["price_cents"] == "2211", r.after
+
+
+def check_a_delete_carries_its_values_as_a_before_image():
+    r = decode.parse_row(DELETE_DEFAULT)
+    assert r.after is None
+    assert r.before == {"order_id": "12", "line_no": "2"}
+
+
+def check_no_tuple_data_is_an_empty_image_and_not_a_missing_one():
+    r = decode.parse_row(DELETE_NOTHING)
+    assert r.before == {}
+    assert r.before is not None

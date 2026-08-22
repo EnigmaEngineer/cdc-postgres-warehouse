@@ -23,26 +23,73 @@ from collections import namedtuple
 
 Change = namedtuple("Change", "table action before after")
 
+# Same line, read for values instead of for field names. Two types rather than one flag,
+# because a caller that wanted names and got a dict fails on the next line rather than
+# three functions later.
+Row = namedtuple("Row", "table action before after")
+
 _HEAD = re.compile(r"^table ([^:]+): (INSERT|UPDATE|DELETE): (.*)$", re.S)
 
-# name[type]:value. Counting these is how field width is measured. A text value containing
-# a literal bracket-colon run would inflate the count. Nothing this repo writes does that,
-# and tests/test_decode.py pins the behaviour so a future reader knows the limit is known.
-_FIELD = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)\[[^\]]*\]:")
+# name[type]: is where a field starts. Where it ends is the value's business, so the value
+# is read by a scanner rather than by the same regex. A text column can hold a space and it
+# can hold a quote written as two quotes, and one pattern cannot stop correctly at both.
+_FIELD_START = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]:")
 
 NO_TUPLE = "(no-tuple-data)"
 
 
-def _fields(fragment):
+def _read_value(text, i):
+    """Read one value starting at i. Returns the value and the index just past it."""
+    if i < len(text) and text[i] == "'":
+        i += 1
+        buf = []
+        while i < len(text):
+            if text[i] == "'":
+                if text[i + 1:i + 2] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                return "".join(buf), i + 1
+            buf.append(text[i])
+            i += 1
+        # A quote that never closes means the line arrived truncated. Returning the part
+        # that was read hands the consumer half a value looking like a whole one.
+        raise ValueError("unterminated quoted value: " + text[:60])
+    j = i
+    while j < len(text) and not text[j].isspace():
+        j += 1
+    raw = text[i:j]
+    return (None if raw == "null" else raw), j
+
+
+def _pairs(fragment):
+    """Every field in a fragment, with quotes taken off. Name and type and value each."""
     if fragment is None:
         return None
     if NO_TUPLE in fragment:
         return []
-    return _FIELD.findall(fragment)
+    out = []
+    pos = 0
+    while True:
+        m = _FIELD_START.search(fragment, pos)
+        if not m:
+            return out
+        value, pos = _read_value(fragment, m.end())
+        out.append((m.group(1), m.group(2), value))
 
 
-def parse_change(line):
-    """One decoded row into a Change, or None for BEGIN and COMMIT markers."""
+def _fields(fragment):
+    p = _pairs(fragment)
+    return None if p is None else [name for name, _, _ in p]
+
+
+def _split(line):
+    """Table, action, and the raw before and after fragments. None if this is not a change.
+
+    Splitting the shape out from the field reading is what lets one line be read two ways.
+    The counting path wants names. The consumer wants values. They must not disagree about
+    which half of an update is the old row.
+    """
     m = _HEAD.match(line.strip())
     if not m:
         return None
@@ -51,14 +98,44 @@ def parse_change(line):
     if "old-key:" in rest or "old-tuple:" in rest:
         head, _, tail = rest.partition("new-tuple:")
         old = head.split(":", 1)[1] if ":" in head else head
-        return Change(table, action, _fields(old), _fields(tail))
+        return table, action, old, tail
 
     if action == "DELETE":
         # What a delete shows is the row identity, which is a before image and never an
         # after image. Calling it 'after' would make the consumer read it backwards.
-        return Change(table, action, _fields(rest), None)
+        return table, action, rest, None
 
-    return Change(table, action, None, _fields(rest))
+    return table, action, None, rest
+
+
+def parse_change(line):
+    """One decoded row into a Change, or None for BEGIN and COMMIT markers."""
+    parts = _split(line)
+    if parts is None:
+        return None
+    table, action, before, after = parts
+    return Change(table, action, _fields(before), _fields(after))
+
+
+def parse_row(line):
+    """The same line read for its values, which is what a consumer needs.
+
+    before and after come back as column to value dicts. Everything is a string or None,
+    because test_decoding prints the output function of the type and this repo is not in
+    the business of guessing which Python type a bigint should become.
+    """
+    parts = _split(line)
+    if parts is None:
+        return None
+    table, action, before, after = parts
+    return Row(table, action, _image(before), _image(after))
+
+
+def _image(fragment):
+    p = _pairs(fragment)
+    if p is None:
+        return None
+    return {name: value for name, _, value in p}
 
 
 def parse_stream(lines):
