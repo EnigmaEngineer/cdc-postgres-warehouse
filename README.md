@@ -39,6 +39,13 @@ tested of the two.
         |  cdc/delivery.py   routing, interleaving, compaction
         v
   cdc/consumer.py            apply, ordered by log position, keyed by primary key
+        |                    in memory, and the reference the SQL is graded against
+        v
+  warehouse/merge.py         reduce the batch, MERGE it, soft delete, record the batch
+  warehouse/sql.py           the statements, duckdb and Snowflake
+        |
+        v
+  wh_customer  wh_product  wh_order_header  wh_order_item  cdc_applied_batch
 ```
 
 Kafka and Kafka Connect are not running here yet. The connector config is generated and
@@ -149,7 +156,7 @@ included.
 | `compacted` | 482 | 0 | 0 | exact |
 | `interleaved_tombstone_ignored` | 482 | 0 | 0 | exact |
 | `interleaved_key_as_row` | 482 | 0 | 0 | exact |
-| `shuffled` | 445 | 37 | 0 | **wrong** |
+| `shuffled` | 482 | 0 | 0 | exact |
 | `shuffled_open` | 561 | 128 | 207 | **wrong** |
 
 `order` key, 188 of 1415 record keys carry more than one row
@@ -162,7 +169,7 @@ included.
 | `compacted` | 258 | 224 | 0 | **wrong** |
 | `interleaved_tombstone_ignored` | 482 | 0 | 0 | exact |
 | `interleaved_key_as_row` | 258 | 224 | 0 | **wrong** |
-| `shuffled` | 330 | 152 | 0 | **wrong** |
+| `shuffled` | 418 | 64 | 0 | **wrong** |
 | `shuffled_open` | 458 | 199 | 175 | **wrong** |
 
 **Under the default key every delivery order Kafka can produce is exact.** All four tables,
@@ -215,12 +222,140 @@ A firing count of zero measured on that arm says nothing about whether the guard
 
 The shuffle arm is the one that exercises it. It breaks 3,472 same key pairs, which Kafka
 never does, and there the guard is worth 207 wrong rows. Removing it takes the target from
-445 rows with none wrong to 561 rows with 207 that should not be there.
+482 rows with none wrong to 561 rows with 207 that should not be there.
+
+### A tombstone gets the same comparison as everything else
+
+The shuffle row above used to read 445 and 37 missing. That was not the shuffle. The
+tombstone path applied the record key with no position comparison at all, so a tombstone
+delivered behind a newer change to its own row removed a row that had already moved past
+it. Under `order_id` it cost 152 rows rather than 64.
+
+Nothing found it for a day. What found it was the SQL merge, which gated the same operation
+because a gate is the obvious thing to write in an `update ... where`, and then the two
+implementations were graded against each other on one real stream. They came apart by 37
+`order_item` rows. One of them had to be wrong and it was the older one.
+
+The gate is off when the guard is off, because leaving one half gated is two answers to one
+question inside one function.
 
 I am keeping it. It costs one comparison per record and it is the difference between a
 consumer that is correct and one that is correct as long as nobody widens a partition, adds
 a second writer, or replays a topic out of a snapshot. But calling it tested by the
 interleaved arms would be a claim about an arm that cannot fail.
+
+## The merge, and the two things in it that are not what they look like
+
+`warehouse/merge.py` takes a batch of change records and puts them into a warehouse table
+with a real `MERGE`. `warehouse/sql.py` builds the statements. DuckDB is what runs here.
+The Snowflake statements are generated and read and have never executed, and the notes in
+that file say which of the two each claim came from.
+
+```
+python -m scripts.merge_probe --steps 4000 --seed 11 --batch 250 --markdown
+```
+
+Same workload, same slot, same delivery orders as the consumer measurement. 4,280 row
+changes into four tables holding 1,536 live source rows.
+
+| arm | rows | live | soft deleted | missing | extra | four tables |
+|---|---|---|---|---|---|---|
+| `log_order` | 1,777 | 1,536 | 241 | 0 | 0 | exact |
+| `interleaved` | 1,777 | 1,536 | 241 | 0 | 0 | exact |
+| `shuffled` | 1,777 | 1,536 | 241 | 0 | 0 | exact |
+| `unreduced` | 0 | 0 | 0 | 1,536 | 0 | **refused** |
+| `hard_delete` | 1,536 | 1,536 | 0 | 0 | 0 | exact |
+| `hard_delete_shuffled` | 1,634 | 1,634 | 0 | 0 | 98 | **wrong** |
+| `versioned` | 4,280 | 3,301 | 979 | 0 | 1,709 | **wrong** |
+| `open_shuffled` | 1,777 | 1,611 | 166 | 537 | 612 | **wrong** |
+
+The first three arms are also graded against `cdc/consumer.py` rather than only against the
+source, row by row. Two implementations of one rule that meet in a summary line agree by
+accident.
+
+### The batch has to be collapsed before the statement runs
+
+A batch drained off six partitions holds several changes to one row. A `MERGE` joins the
+staged batch to the target, and two staged rows matching one target row is a question the
+statement has no rule for. So the reduction in front of it keeps one row per merge key at
+the highest log position, and `reduce=False` is there to show what that is worth.
+
+What each engine does with the unreduced version is its own business, and the two available
+here do not agree.
+
+| engine | two staged rows, one target row |
+|---|---|
+| postgres 14.24 | `on conflict do update` refuses. `cannot affect row a second time` |
+| duckdb 1.5.5 | takes one and drops the other, no error |
+
+Which one duckdb takes is decided by insertion order into the stage. Offer it positions 20
+then 30 against a target at 10 and it keeps 20. Offer the same two the other way round and
+it keeps 30. Neither is the highest by rule. Both are the first row it happened to see.
+`warehouse.merge.engine_duplicate_source_behaviour` is what measures that, and it lives in
+the library rather than in a script so a mutation pass can reach it.
+
+The same duplicate pair against an **empty** target goes down the not-matched branch and
+raises a primary key violation instead. So the defect is loud on the branch people test and
+silent on the branch that runs for the rest of the table's life. That is why the
+`unreduced` arm above says refused rather than wrong. It died on its first batch, on the
+loud branch, and the quiet branch is the one that would have cost something.
+
+### The delete is soft because the guard needs somewhere to live
+
+Every merged row carries the source log position it was last written at. The guard compares
+an incoming position against that one. A hard delete removes the row and takes the position
+with it, so a delayed insert that predates the delete finds nothing to compare against and
+puts the row back.
+
+`hard_delete` and `hard_delete_shuffled` are the same warehouse with the flagged rows really
+deleted after each batch. On the interleaved arm it is exact, and it is exact for the same
+reason the ordering guard fires zero times there. On the shuffle it resurrects 98
+`order_item` rows.
+
+So the soft delete costs 241 retained rows out of 1,777, and on every delivery order Kafka
+can produce it buys nothing measurable. That is the third mechanism in this consumer whose
+value cannot be shown on a fair arm. I am keeping it, and I am not going to pretend the
+interleaved arms tested it.
+
+Worth writing down separately: under Debezium's default key the tombstone removes **zero**
+rows across the whole run. Its own delete envelope names the row and removes it first. Every
+row a tombstone has ever removed in this repo is a sibling under a widened key that the
+tombstone could not name.
+
+### "Keyed on the primary key plus the LSN" is not a merge key
+
+That phrasing is the obvious way to describe this and taken literally it builds a different
+table. If the position joins the key then no incoming change ever matches an existing row,
+every change inserts, and what comes out is a history. The `versioned` arm is exactly that
+reading, and it lands 4,280 rows for 1,536 source rows, with 1,709 live rows that are not in
+the source.
+
+The merge key is the primary key. The position is a predicate on the update.
+
+### The batch boundary does not decide the answer
+
+Two changes to one row in one batch meet in the reduction. The same two split across a
+boundary meet in the merge's guard instead. Two code paths, and the warehouse has to come
+out the same either way.
+
+| batch size | batches | collapsed inside a batch | warehouse |
+|---|---|---|---|
+| 1 | 4,650 | 0 | identical |
+| 37 | 126 | 115 | identical |
+| 250 | 19 | 483 | identical |
+| 4,650 | 1 | 2,503 | identical |
+
+Replaying the 19 batches into the same warehouse a second time leaves it byte identical,
+batch column included.
+
+### The batch id goes in inside the merge transaction
+
+A consumer that merges and then commits its Kafka offset has two pieces of state in two
+systems and nothing that makes them agree. `cdc_applied_batch` is written in the same
+transaction as the rows, so the warehouse can be asked what it last applied and the answer
+cannot name a batch whose rows are not sitting beside it. A batch that raises takes the
+ledger row with it, which `tests/test_warehouse.py` shows using a failure duckdb really
+produces rather than a mocked one.
 
 ## Three defaults that are wrong here
 
@@ -298,6 +433,14 @@ byte volume here is neither a counted quantity nor a timing, and it has a small 
 it. Two separate runs of the whole script gave a stream ratio of 1.3019 and 1.3015, so the
 third decimal is not worth reading and the first two are.
 
+The merge probe reports a warehouse fingerprint and it is named `within_run_fingerprint`
+for a reason. Two runs of that script produce identical counts and different hashes, which
+was checked with `diff` rather than assumed. The source tables carry `now()` timestamps, so
+a second workload at the same seed gives the same shape and different data. The fingerprint
+compares two warehouses inside one run, which is what the replay check and the batch size
+check need. It says nothing across runs and the name is there so nobody reads it as if it
+did.
+
 ## The failure mode nobody measures
 
 A replication slot that nobody consumes pins the write ahead log. That is the incident
@@ -363,9 +506,11 @@ count had a range of zero. What reproduces is the shape of the table.
 python tests/run_all.py
 ```
 
-146 checks, no database required. Everything runs on fixtures. The workload planner and the
-decoded change reader and the schema, then the connector config and the partitioner, then
-the record shape and the delivery orders and the apply rules.
+186 checks, no database required. duckdb runs in process, so the merge checks need no
+server either. The workload planner and the decoded change reader and the schema come
+first. Then the connector config and the partitioner. Then the record shape and the
+delivery orders and the apply rules. Then the reduction and the merge statements and the
+soft delete.
 `tests/test_decode.py` uses real `test_decoding` output copied off a running server rather
 than lines written from memory, because a parser tested against invented input tests the
 author's memory of a format.
@@ -393,9 +538,31 @@ before and after. The one worth naming took the delete tuple and reported it as 
 image rather than a before image, which is a plausible reading of the plugin output and
 would have made every delete look like an insert of a two column row.
 
-The latest pass is 26 mutants over the apply rules and the delivery orders and the record
-shape, and the four that survived the first attempt are worth more than the twenty two that
-died.
+The latest pass is 22 mutants over the merge and the statement builders and the tombstone
+gate. All 22 die now, control clean either side. Five survived the first attempt and every
+one of them was a real gap.
+
+Two came from the same weak fixture. A delete envelope removes its own row, so its
+tombstone then finds nothing under the key, and a fixture that keeps the envelope cannot
+test the tombstone at all. Taking the gate off entirely and moving it off by one both
+survived. The checks now deliver a tombstone with its envelope removed, which is not an
+artificial shape, because under the default key that is the only shape in which a tombstone
+removes anything.
+
+One was a fixture ordered the wrong way round. Two tombstones under one key, delivered
+newest first, makes "keep the first one seen" and "keep the highest" the same answer.
+
+One was a check rescued by a column it was not about. The fingerprint was supposed to prove
+it respects column order, and the two warehouses it compared also differed in the record key
+column, so a mutant sorting each row survived. The rows go in through raw SQL now, with the
+record key identical on both sides.
+
+One was a check I had just improved. Moving the versioned check to three batches killed a
+mutant about the join and revived one about the reduction, because a single record per batch
+has nothing to collapse. Both checks exist now. They are two different rules.
+
+The earlier pass, 26 mutants over the apply rules and the delivery orders and the record
+shape, is unchanged.
 
 One was dead code. Taking the high water mark to `max(held, incoming)` cannot change
 anything, because the guard already dropped everything below the mark. A line no mutation
@@ -422,9 +589,25 @@ the repo is correct would do the same thing if it were scanning nothing.
 
 ## Known limitations
 
-- **The consumer applies to a dictionary, not to a warehouse.** The rules are real and the
-  target is memory. The same rules written as a MERGE, and the reconciliation that checks
-  them, are the work ahead.
+- **The warehouse is duckdb and the Snowflake statements have never run.** Every merge
+  figure here came off duckdb 1.5.5 in process. `warehouse/sql.py` generates the Snowflake
+  text and a test asserts that each claim about Snowflake in that file is labelled
+  unverified. Reading a statement is not running it. The reconciliation that compares
+  source and target row by row is the work ahead.
+- **The soft delete buys nothing measurable on any arm Kafka can produce.** It costs 241
+  retained rows out of 1,777 and it is worth 98 rows on a shuffle the broker does not do.
+  Same shape as the ordering guard. Both are kept on an argument about future shapes.
+- **Nothing expires a soft deleted row.** The position it holds is the only reason it is
+  there and the table grows forever. The window it really needs is a function of how far
+  out of order records can arrive, which is not measured here.
+- **The batch id in the warehouse is not yet joined to a Kafka offset.** The ledger row
+  goes in inside the merge transaction, so the warehouse can say what it last applied. It
+  says a batch number that this repo assigns. Nothing has committed an offset to a broker,
+  so the half of the problem the ledger exists to solve is still modelled.
+- **`scripts/merge_probe.py` has no tests over its database plumbing**, the same gap as the
+  other two probes. Every figure it prints comes out of `warehouse/merge.py` or
+  `cdc/consumer.py`, which are tested. The part that opens a connection and resets a schema
+  is not.
 - **The consumer has never read a Kafka topic.** It reads a change stream out of a
   replication slot and the records are built here rather than by a connector. The routing
   and the interleaving are models of what a topic would deliver, using Kafka's own
