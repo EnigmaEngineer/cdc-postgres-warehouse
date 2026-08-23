@@ -191,3 +191,64 @@ def check_an_unknown_op_is_refused():
         assert "unknown op" in str(exc), exc
         return
     raise AssertionError("a record with an unknown op was applied")
+
+
+def check_a_tombstone_behind_a_newer_change_leaves_the_row_alone():
+    """The tombstone is subject to the same position comparison as everything else.
+
+    This path used to pop every row under the key with no comparison at all, so a
+    tombstone delivered after a newer change removed a row that had moved past it. The SQL
+    merge gated the same operation, the two were graded against each other on a real
+    stream, and they disagreed by 37 rows on the shuffled arm.
+    """
+    stream = _stream([(10, _row(1, 1)), (20, _row(1, 1, "DELETE")),
+                      (40, _row(1, 1, "UPDATE", "9"))], columns=("order_id",))
+    newest_first = [e for e in stream if e.lsn == 40] + [e for e in stream if e.lsn != 40]
+    r = consumer.apply_events(newest_first, merge_keys=PK)
+    assert _applied(r) == {("1", "1", "9")}, _applied(r)
+    assert r.counters["rows_kept_from_a_stale_tombstone"] == 1, r.counters
+
+
+def check_a_tombstone_in_front_of_the_row_still_removes_it():
+    """The mirror. Without it the gate could refuse every tombstone and the check above
+    would pass anyway."""
+    stream = _stream([(10, _row(1, 1)), (20, _row(1, 1, "DELETE"))],
+                     columns=("order_id",))
+    r = consumer.apply_events(stream, merge_keys=PK)
+    assert _applied(r) == set(), _applied(r)
+    assert r.counters["rows_kept_from_a_stale_tombstone"] == 0, r.counters
+
+
+def _bare_tombstone(lsn, order_id=1, line_no=1):
+    """A tombstone with its delete envelope taken away.
+
+    Every check below needs one, because a delete envelope removes the row itself and its
+    tombstone then finds nothing under the key. Two mutants of the gate survived a fixture
+    that kept the envelope, for exactly that reason. Under the default record key this is
+    not an artificial shape either. It is the only shape in which a tombstone can remove
+    anything at all.
+    """
+    stream = _stream([(lsn, _row(order_id, line_no, "DELETE"))], columns=("order_id",))
+    return [e for e in stream if e.tombstone]
+
+
+def check_the_tombstone_gate_comes_off_with_the_guard():
+    """guard=False is the same consumer with the position rule removed everywhere.
+
+    Leaving the tombstone gated while the merge is open would be two different answers to
+    one question inside one function.
+    """
+    live = _stream([(10, _row(1, 1)), (40, _row(1, 1, "UPDATE", "9"))],
+                   columns=("order_id",))
+    r = consumer.apply_events(list(live) + _bare_tombstone(20), guard=False, merge_keys=PK)
+    assert _applied(r) == set(), _applied(r)
+
+
+def check_a_tombstone_level_with_the_row_still_removes_it():
+    """The boundary. The tombstone and its delete share a position, so a gate written
+    with >= rather than > refuses every tombstone that arrives on time."""
+    live = _stream([(10, _row(1, 1)), (20, _row(1, 1, "UPDATE", "9"))],
+                   columns=("order_id",))
+    r = consumer.apply_events(list(live) + _bare_tombstone(20), merge_keys=PK)
+    assert _applied(r) == set(), _applied(r)
+    assert r.counters["rows_kept_from_a_stale_tombstone"] == 0, r.counters

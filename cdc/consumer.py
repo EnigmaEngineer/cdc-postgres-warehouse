@@ -25,7 +25,10 @@ the guard exists for.
 
 **A tombstone carries a record key and nothing else.** It cannot name a row when the record
 key covers more than one. Applying it is then a decision about which rows go, and the
-honest answer for a consumer merging on the primary key is that it does not know.
+honest answer for a consumer merging on the primary key is that it does not know. It is
+also subject to the same position comparison as everything else, because a tombstone that
+turns up behind a newer change to the row is stale in exactly the way a delete envelope
+would be.
 """
 
 from collections import namedtuple
@@ -33,7 +36,13 @@ from collections import namedtuple
 Result = namedtuple("Result", "rows counters")
 
 
-def _identity(image, columns):
+def identity(image, columns):
+    """The merge key of one row image, or None when the image does not carry it.
+
+    Public because warehouse/merge.py has to derive the same key the same way. Two
+    definitions of what identifies a row is how the SQL merge and the in-memory reference
+    end up disagreeing for a reason neither of them reports.
+    """
     if image is None:
         return None
     if any(c not in image for c in columns):
@@ -66,6 +75,7 @@ def apply_events(events, guard=True, on_tombstone="delete", merge_keys=None):
         "stale_dropped": 0, "same_position": 0,
         "deletes_of_a_row_not_held": 0, "updates_of_a_row_not_held": 0,
         "rows_removed_by_tombstones": 0, "changes_with_no_merge_key": 0,
+        "rows_kept_from_a_stale_tombstone": 0,
     }
 
     for e in events:
@@ -74,16 +84,28 @@ def apply_events(events, guard=True, on_tombstone="delete", merge_keys=None):
         if e.tombstone:
             counters["tombstones"] += 1
             if on_tombstone == "delete":
-                for slot in sorted(under_key.pop((e.topic, e.key_bytes), ())):
+                held = under_key.get((e.topic, e.key_bytes), ())
+                # The guard applies here too. This path used to pop every row under the
+                # key with no position comparison at all, which meant a tombstone that
+                # arrived after a newer change removed a row that had moved past it. The
+                # SQL merge gated the same operation and the two implementations then
+                # disagreed by 37 rows on the shuffled arm. That disagreement is what
+                # found this.
+                for slot in sorted(held):
+                    at = watermark.get(slot)
+                    if guard and at is not None and at > e.lsn:
+                        counters["rows_kept_from_a_stale_tombstone"] += 1
+                        continue
                     if rows.pop(slot, None) is not None:
                         counters["rows_removed_by_tombstones"] += 1
+                    _forget(under_key, e, slot)
             continue
 
         image = e.after if e.op != "d" else e.before
         if merge_keys is None:
             slot = (e.topic, e.key_bytes)
         else:
-            ident = _identity(image, merge_keys[e.table])
+            ident = identity(image, merge_keys[e.table])
             if ident is None:
                 # A replica identity narrow enough to leave a merge column out makes this
                 # change unaddressable. Counting it is the point. Guessing is what a
