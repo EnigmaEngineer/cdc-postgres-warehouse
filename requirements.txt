@@ -5,3 +5,8 @@
 # this repo is meant to run on a machine with nothing installed. The binary wheel carries
 # its own libpq. Pinned to the version the change decoding figures in the README came off.
 psycopg2-binary==2.9.12
+
+# duckdb is the warehouse the merge runs against. Pinned rather than ranged because MERGE
+# INTO is recent and the numbers this repo publishes about it, including the one about
+# duplicate staged rows, were measured on this exact build.
+duckdb==1.5.5

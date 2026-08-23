@@ -18,7 +18,7 @@ DIST_TO_MODULE = {
     "psycopg2-binary": "psycopg2",
 }
 
-LOCAL_PACKAGES = {"cdc", "load", "tests", "scripts", "db"}
+LOCAL_PACKAGES = {"cdc", "load", "tests", "scripts", "db", "warehouse"}
 
 
 def python_files():
