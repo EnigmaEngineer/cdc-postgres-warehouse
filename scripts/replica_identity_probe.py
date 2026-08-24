@@ -22,6 +22,7 @@ import psycopg2  # noqa: E402
 
 from cdc import decode, pg, probe  # noqa: E402
 from load import apply as applier  # noqa: E402
+from load import drive  # noqa: E402
 from load import workload  # noqa: E402
 
 TABLES = ("shop.customer", "shop.product", "shop.order_header", "shop.order_item")
@@ -59,10 +60,8 @@ def run_arm(cur, schema_path, mode, seed, steps, customers, products):
     # they agree resting on nothing.
     pg.create_slot(cur, SLOT_PGO, "pgoutput")
 
-    seed_rows = dict.fromkeys(workload.TABLES, 0)
-    seed_rows["customer"] = customers
-    seed_rows["product"] = products
-    plan = workload.plan(seed, steps, seed_rows=seed_rows)
+    plan = workload.plan(seed, steps,
+                         seed_rows=drive.seed_row_counts(customers, products))
 
     start = pg.current_lsn(cur)
     a = applier.Applier(cur, seed)

@@ -36,6 +36,7 @@ from cdc import decode  # noqa: E402
 from cdc import pg  # noqa: E402
 from cdc import topics  # noqa: E402
 from load import apply as applier  # noqa: E402
+from load import drive  # noqa: E402
 from load import workload  # noqa: E402
 
 SLOT_A = "layout_wide"
@@ -128,10 +129,8 @@ def arm_filtered_and_laggard(cur, steps, seed, customers, products, schema_path=
             per_table_pub(table), table))
         pg.create_slot(cur, per_table_slot(table), "pgoutput")
 
-    seed_rows = dict.fromkeys(workload.TABLES, 0)
-    seed_rows["customer"] = customers
-    seed_rows["product"] = products
-    plan = workload.plan(seed, steps, seed_rows=seed_rows)
+    plan = workload.plan(seed, steps,
+                         seed_rows=drive.seed_row_counts(customers, products))
 
     start = pg.current_lsn(cur)
     hand = applier.Applier(cur, seed)

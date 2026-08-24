@@ -38,7 +38,7 @@ from cdc import delivery  # noqa: E402
 from cdc import events  # noqa: E402
 from cdc import pg  # noqa: E402
 from cdc import topics  # noqa: E402
-from load import apply as applier  # noqa: E402
+from load import drive  # noqa: E402
 from load import workload  # noqa: E402
 
 SLOT = "consumer_probe"
@@ -78,26 +78,6 @@ def truth(cur, table, columns):
     select = ", ".join("{}::text".format(c) for c in columns)
     cur.execute("select {} from shop.{}".format(select, table))
     return {tuple(r) for r in cur.fetchall()}
-
-
-def run_workload(cur, seed, steps, customers, products):
-    """The same workload scripts/topic_layout_probe.py drives, built the same way.
-
-    seed_rows has to say the dimension tables are already populated. Telling the planner
-    they are empty turns the first update on each into an insert, which advances the
-    applier's generator differently and produces a different database from the same seed.
-    The two probes then disagree about the split rate for a reason nobody would find.
-    """
-    seed_rows = dict.fromkeys(workload.TABLES, 0)
-    seed_rows["customer"] = customers
-    seed_rows["product"] = products
-    plan = workload.plan(seed, steps, seed_rows=seed_rows)
-    a = applier.Applier(cur, seed)
-    a.adopt_existing()
-    seeded = a.seed_dimensions(customers, products)
-    applied, skipped = a.run(plan.ops)
-    return {"seeded": seeded, "applied": applied, "skipped": skipped,
-            "deflected": plan.deflected}
 
 
 def build_arms(evs, partitions, seed, merge_keys):
@@ -147,8 +127,8 @@ def main():
     pg.drop_slot_if_exists(cur, SLOT)
     pg.create_slot(cur, SLOT, "test_decoding")
 
-    report["workload"] = run_workload(cur, args.seed, args.steps, args.customers,
-                                      args.products)
+    report["workload"] = drive.run_workload(cur, args.seed, args.steps,
+                                           args.customers, args.products)
 
     raw = pg.peek_changes_with_lsn(cur, SLOT)
     rows = [(lsn, decode.parse_row(data)) for lsn, data in raw]
