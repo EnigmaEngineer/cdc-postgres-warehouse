@@ -46,6 +46,10 @@ tested of the two.
         |
         v
   wh_customer  wh_product  wh_order_header  wh_order_item  cdc_applied_batch
+        |
+        |  warehouse/reconcile.py   reads both ends and compares them key by key
+        v
+  missing, extra, differing, and how much of the table the verdict is about
 ```
 
 Kafka and Kafka Connect are not running here yet. The connector config is generated and
@@ -357,6 +361,98 @@ cannot name a batch whose rows are not sitting beside it. A batch that raises ta
 ledger row with it, which `tests/test_warehouse.py` shows using a failure duckdb really
 produces rather than a mocked one.
 
+## The reconciliation, and the number it has to publish about itself
+
+`warehouse/reconcile.py` compares the source tables against the warehouse a key at a time.
+`python3 -m scripts.reconcile_probe --steps 4000 --seed 11 --markdown` prints both tables
+below. Postgres 14.24, duckdb 1.5.5, 4,650 records over four tables holding 1,536 live
+source rows.
+
+The easy version of this job is a set difference, and `cdc/consumer.py` already has one.
+It answers whether two row sets are equal, which is the right answer to a different
+question. A row whose `status` moved from `paid` to `shipped` is one row that drifted. Set
+subtraction sees a tuple in the source the target does not have and a tuple in the target
+the source does not have, so it counts two, and it cannot say which column moved.
+
+| arm | keyed: missing | extra | differing | set subtraction reports |
+|---|---|---|---|---|
+| `quiesced` | 0 | 0 | 0 | 0 |
+| `lag_25` | 402 | 77 | 342 | 1,163 |
+| `lag_50` | 755 | 88 | 443 | 1,729 |
+| `lag_75` | 1,063 | 55 | 349 | 1,816 |
+
+821 rows are involved on the `lag_25` arm and the set difference calls it 1,163, which is
+821 plus the 342 that drifted counted a second time. The keyed report also says the 342
+broke down as 140 `updated_at`, 105 `status` and the rest across four other columns. That
+is a cause. The other number is a page.
+
+### Comparing a live source against a lagging target measures the lag
+
+This is the part that decides whether the job is worth running. Everything sitting in the
+log unapplied looks exactly like drift. On the `lag_25` arm, a quarter of the stream held
+back, the reconciliation reports 821 mismatched rows and every single one of them is lag.
+Nothing is wrong. Run that nightly and somebody stops reading it inside a week.
+
+The way out is to leave out any key with a change still in flight. It works. It takes
+every arm to zero. And the price is in the column nobody would think to print.
+
+| arm | held back | reported drift, no exclusion | left after exclusion | keys checked | coverage | verdict |
+|---|---|---|---|---|---|---|
+| `quiesced` | 0 | 0 | 0 | 1,536 | 100.0% | `clean` |
+| `lag_25` | 1,162 | 821 | 0 | 786 | 48.7% | `clean_partial` |
+| `lag_50` | 2,325 | 1,286 | 0 | 332 | 20.4% | `clean_partial` |
+| `lag_75` | 3,488 | 1,467 | 0 | 122 | 7.7% | `clean_partial` |
+
+Coverage falls much faster than the lag does. Half the stream held back leaves 20.4 percent
+of keys checkable, not half. The reason is that one held back record removes a whole key
+from the report, and 4,650 records land on 1,536 keys, so a backlog names far more distinct
+keys than its own size suggests. At `lag_50` the 2,325 held back records name 1,292 keys of
+1,624. A busy table is exactly where this is worst.
+
+So a reconciliation with an exclusion in it can report a clean run over 7.7 percent of the
+table, and 7.7 percent is not printed anywhere unless somebody decides to print it.
+
+### What the exclusion gives up, shown rather than argued
+
+The probe takes the `lag_50` warehouse, picks a row whose key the exclusion is about to
+hide, and moves one column that has nothing to do with the change in flight. It sets
+`email` on `customer` 1 to a string no workload produces. Then it reconciles again.
+
+    with the exclusion       clean_partial
+    without the exclusion    drift
+
+The corruption is real, the reconciliation is looking straight at it, and the exclusion
+tells it not to. That is not a bug in the exclusion. It is what the exclusion is, and a
+job that hides real damage on the rows most likely to be damaged should say so out loud
+rather than in a footnote.
+
+### Three verdicts were not enough, and the fourth is not a threshold
+
+The first version had `clean`, `drift`, and `no_coverage` for a report that checked zero
+keys. `no_coverage` never fired. It cannot, because zero checked keys means every key in
+the table has a change in flight, and that does not happen. Meanwhile the run above came
+back `clean` at 20.4 percent coverage and again at 7.7 percent, which is the exact failure
+that verdict was invented to prevent, arriving one step to the left of where it was
+watching.
+
+A pass over part of the table is now its own answer. The boundary is coverage below 1.0,
+which is a fact about the run rather than a number anybody chose. Sitting it in the gap
+between 7.7 and 100 would have meant picking it off the arms it was about to judge.
+
+### The two counts that had to stay apart
+
+`keys_in_flight` reports tombstones and unkeyable changes separately. A tombstone carries
+no row image, so it names no key, and there are 104 of them held back on `lag_25`. A change
+record whose image does not carry the merge key columns is a defect in the replica identity
+and somebody needs to hear about it. Folded into one counter the second hides behind the
+first forever.
+
+They were one counter until a mutation pass. A mutant deleting the tombstone branch
+entirely survived the whole suite, because `identity` returns `None` on a tombstone's
+absent image and the count landed in the same place either way, so the branch was doing
+nothing at all. Splitting the counter is what gave it something to do. That mutant and two
+more about the split now die.
+
 ## Three defaults that are wrong here
 
 `cdc/connector.py` refuses to emit a config that leaves any of these alone, and
@@ -506,7 +602,7 @@ count had a range of zero. What reproduces is the shape of the table.
 python tests/run_all.py
 ```
 
-186 checks, no database required. duckdb runs in process, so the merge checks need no
+206 checks, no database required. duckdb runs in process, so the merge checks need no
 server either. The workload planner and the decoded change reader and the schema come
 first. Then the connector config and the partitioner. Then the record shape and the
 delivery orders and the apply rules. Then the reduction and the merge statements and the
@@ -523,6 +619,11 @@ green without running any of them, and there are four such rules.
 `org.apache.kafka.common.utils.Utils.murmur2`. Three of them have the sign bit set,
 because that is the only input where masking and taking an absolute value disagree and
 every other vector leaves the rule untested.
+
+`tests/test_reconcile.py` builds a fixture carrying a key that covers two rows and a row
+that differs on exactly one column. Without the first, no rule about choosing between rows
+under one key ever runs. Without the second, a comparison that only looks at keys passes
+every check a comparison that looks at values would.
 
 `tests/test_connector.py` opens with a list of legitimate Debezium properties the
 validator must not refuse. A guardrail is judged first on what it wrongly blocks, because
@@ -592,8 +693,29 @@ the repo is correct would do the same thing if it were scanning nothing.
 - **The warehouse is duckdb and the Snowflake statements have never run.** Every merge
   figure here came off duckdb 1.5.5 in process. `warehouse/sql.py` generates the Snowflake
   text and a test asserts that each claim about Snowflake in that file is labelled
-  unverified. Reading a statement is not running it. The reconciliation that compares
-  source and target row by row is the work ahead.
+  unverified. Reading a statement is not running it. The reconciliation reads its source
+  through Postgres and its target through duckdb, so it has never compared a real
+  warehouse either.
+- **The in flight exclusion is only as good as the pending set it is handed.** Here the
+  probe knows exactly which records it held back. A real consumer would have to read that
+  set off the broker's committed offsets, or off the slot, and both of those are behind by
+  however long the read takes. A key that moves in that gap is checked against a source
+  that has already changed.
+- **The reconciliation is never run against a warehouse being written to.** The probe
+  applies a prefix of the stream, stops, and then compares. That is lag standing still. A
+  real run reads the two ends at two different instants while a merge is in progress, and
+  nothing here measures what that costs.
+- **`changes_with_no_key` has never been non zero outside a test.** It counts a change
+  record whose image does not carry the merge key columns, which needs a replica identity
+  that has stopped carrying them or a merge key wider than the record key. Both are real
+  and neither is in this workload, so the counter is exercised by one check and nothing
+  else.
+- **The corruption arm moves one column in one row.** It is enough to show that the
+  exclusion hides a real error, which is what it is for. It says nothing about how much
+  damage would go unseen at a given lag, and that is the number somebody running this
+  would actually want.
+- **`scripts/reconcile_probe.py` has no tests over its database plumbing**, the same gap
+  as the other three probes.
 - **The soft delete buys nothing measurable on any arm Kafka can produce.** It costs 241
   retained rows out of 1,777 and it is worth 98 rows on a shuffle the broker does not do.
   Same shape as the ordering guard. Both are kept on an argument about future shapes.
