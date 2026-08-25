@@ -442,3 +442,53 @@ def check_a_record_off_an_unknown_topic_is_counted_rather_than_dropped_quietly()
     rows, tombs, counters = wh.reduce_batch(stray, {"some.other.topic": target})
     assert counters["records_off_a_known_topic"] == 1, counters
     assert rows == {} and tombs == {}
+
+
+def check_the_defaults_are_exercised_and_not_only_the_named_arguments():
+    """Build the warehouse with nothing named and confirm it is the unversioned one.
+
+    The helper above passes `versioned` on every call, so flipping the default in the
+    signature changed no test and a mutant that did it survived. Three functions in this
+    repo were in that state at once. This one and `reduce_batch` and the offset store in
+    `warehouse/recovery.py`. A default nothing exercises is the setting every caller who
+    has not read the source ends up with.
+    """
+    house = wh.Warehouse(duckdb.connect(), [_target()])
+    house.create()
+    evs = _stream([(10, _row(1, 1, qty="1")), (20, _row(1, 1, "UPDATE", qty="9"))])
+    house.apply_batch(evs, 1, merge_keys=PK)
+    got = house.con.execute('select "qty" from "wh_order_item"').fetchall()
+    assert got == [("9",)], got
+
+    rows, _, _ = wh.reduce_batch(evs, {TOPIC: _target()})
+    assert len(rows) == 1, rows
+
+
+def check_counting_an_empty_target_reports_zero_rather_than_raising():
+    # `sum` over no rows is null, so `live or 0` is what keeps this a count. Nothing else
+    # in the repo calls counts() on an empty table, which is why the guard's mutant
+    # survives, and removing it turns a report into an exception.
+    house = _warehouse()
+    got = house.counts()
+    assert got["wh_order_item"] == {"rows": 0, "live": 0, "soft_deleted": 0}, got
+
+
+def check_the_unreduced_staging_keeps_every_record_rather_than_the_last():
+    # The losing arm. It is only ever run through a path that raises, so its own rules
+    # were never graded, and a hand built losing side is the thing this repo has been
+    # caught rigging before.
+    evs = _stream([(10, _row(1, 1, qty="1")), (20, _row(1, 1, "UPDATE", qty="9"))])
+    staged, tombs, counters = wh._stage_unreduced(evs, {TOPIC: _target()}, PK)
+    assert len(staged) == 2, staged
+    assert [r["lsn"] for r in staged] == [10, 20], staged
+    assert counters["staged_rows"] == 2, counters
+    assert tombs == {}
+
+
+def check_the_unreduced_staging_marks_a_delete_and_holds_the_newest_tombstone():
+    evs = _stream([(10, _row(1, 1)), (30, _row(1, 1, "DELETE")), (20, _row(1, 1, "DELETE"))])
+    staged, tombs, counters = wh._stage_unreduced(evs, {TOPIC: _target()}, PK)
+    assert [r["deleted"] for r in staged] == [False, True, True], staged
+    assert counters["tombstones"] == 2, counters
+    # Two tombstones under one key and the higher position is the one that survives.
+    assert list(tombs.values()) == [30], tombs

@@ -35,6 +35,28 @@ from cdc.consumer import identity
 from warehouse import sql as W
 
 
+# The three moments inside `apply_batch`'s transaction where a consumer process can die.
+# In statement order. `tombstoned` is the interesting one: everything the batch does to the
+# data has happened and the ledger row has not been written, which is the state a consumer
+# keeping its offset outside the transaction would be in permanently.
+FAILURE_POINTS = ("staged", "merged", "tombstoned")
+
+
+class Crash(Exception):
+    """An injected process death. Not a database error and not caught like one.
+
+    It is a distinct type on purpose. A blanket except in `merge_probe` once turned a
+    parser error into eight arms quietly reporting `refused`, and a chaos arm that swallows
+    a real duckdb failure while claiming to have injected one is the same defect with a
+    worse story.
+    """
+
+    def __init__(self, point, batch):
+        Exception.__init__(self, "crash at {} in batch {}".format(point, batch))
+        self.point = point
+        self.batch = batch
+
+
 class Target(object):
     """One source table and the warehouse table it lands in."""
 
@@ -148,17 +170,26 @@ class Warehouse(object):
         self.con.execute(W.ledger_ddl(self.dialect))
 
     def apply_batch(self, events, batch, merge_keys=None, on_tombstone="delete",
-                    guard=True, reduce=True, consumer="cdc"):
+                    guard=True, reduce=True, consumer="cdc", fail_at=None):
         """One batch, one transaction, and the batch id written inside it.
 
         The ledger write is the point of the transaction. A consumer that merges and then
         commits its offset separately has two pieces of state in two systems and no way to
         find out they disagree. Here the warehouse can be asked what it last applied and
         the answer cannot name a batch whose rows are not in the table beside it.
+
+        fail_at names a point inside the transaction and raises there. A consumer process
+        can die at any of them and the three are not equivalent, so a chaos arm has to be
+        able to pick one. It lives here rather than in a probe because the points are
+        properties of this function, and a list of them kept somewhere else goes stale the
+        first time the order of the statements changes.
         """
         if on_tombstone not in ("delete", "ignore"):
             raise ValueError("on_tombstone must be delete or ignore, got "
                              + repr(on_tombstone))
+        if fail_at is not None and fail_at not in FAILURE_POINTS:
+            raise ValueError("fail_at must be one of {}, got {!r}".format(
+                ", ".join(FAILURE_POINTS), fail_at))
 
         if reduce:
             rows, tombs, counters = reduce_batch(events, self.by_topic, merge_keys,
@@ -178,10 +209,16 @@ class Warehouse(object):
                     "insert into {} values ({})".format(W.quote(t.stage), placeholders),
                     list(row["values"]) + [row["record_key"], row["lsn"], row["deleted"]])
 
+            if fail_at == "staged":
+                raise Crash("staged", batch)
+
             for t in self.targets:
                 self.con.execute(W.merge_sql(self.dialect, t.name, t.stage, t.columns,
                                              t.key_columns, batch, guard=guard,
                                              versioned=self.versioned))
+
+            if fail_at == "merged":
+                raise Crash("merged", batch)
 
             removed = 0
             if on_tombstone == "delete":
@@ -191,6 +228,9 @@ class Warehouse(object):
                     self.con.execute(W.tombstone_sql(self.dialect, t.name, batch),
                                      [record_key, lsn])
                     removed += before - self._live_count(t.name)
+
+            if fail_at == "tombstoned":
+                raise Crash("tombstoned", batch)
 
             self.con.execute(W.record_batch_sql(self.dialect),
                              [consumer, batch, counters["records"]])
