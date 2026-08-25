@@ -61,16 +61,21 @@ def apply_prefix(order, batch_size, merge_keys, fraction):
 
 
 def flat(report):
-    """Roll the four per table reports into one line, which is what a pager reads."""
-    keys = ("checked", "excluded_in_flight", "matching", "missing", "extra", "differing",
-            "duplicate_keys_in_target")
-    out = {k: sum(t[k] for t in report["tables"].values()) for k in keys}
-    every = sum(t["keys_either_side"] for t in report["tables"].values())
-    out["keys_either_side"] = every
-    out["coverage"] = None if not every else round(out["checked"] / every, 4)
-    out["verdict"] = report["verdict"]
-    out["mismatched"] = out["missing"] + out["extra"] + out["differing"]
-    return out
+    """The pager line, plus the check that its coverage relates to the per table ones.
+
+    `rec.one_line` used to live here. It computes coverage by summing both sides, and
+    `rec.reconcile` computes it a table at a time, so the repo had two definitions of one
+    published number with nothing tying them together. The rule that holds between them is
+    now asserted on every arm this probe runs rather than being a property somebody
+    believed.
+    """
+    line = rec.one_line(report)
+    agrees = rec.coverage_is_between_the_tables(report, line)
+    if agrees is False:
+        raise ValueError("rolled up coverage {} is outside the per table range".format(
+            line["coverage"]))
+    line["coverage_is_between_the_tables"] = agrees
+    return line
 
 
 def set_difference_view(cur, warehouse):

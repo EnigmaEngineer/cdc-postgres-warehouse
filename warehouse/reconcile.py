@@ -228,3 +228,44 @@ def rollup(tables):
             return name
     raise ValueError("unknown verdict in " + repr(sorted(
         {t["verdict"] for t in tables.values()})))
+
+
+SUMMED = ("checked", "excluded_in_flight", "matching", "missing", "extra", "differing",
+          "duplicate_keys_in_target")
+
+
+def one_line(report):
+    """The four per table reports as the single line a pager reads.
+
+    This was in the probe, which meant coverage had two definitions in one repo with
+    nothing relating them. `reconcile` divides one table's checked keys by that table's
+    keys. This divides the sum by the sum. They are different numbers and both are called
+    coverage, which is the shape that put a p50 from two quantile definitions into one
+    total on another project here.
+
+    The relation that does hold is that a sum of ratios weighted by their denominators
+    lands between the smallest and the largest of them, and `coverage_is_between_the_tables`
+    asserts exactly that rather than leaving it to the reader. Nothing weaker is worth
+    printing, because a check that both numbers merely exist is not a check.
+    """
+    tables = report["tables"]
+    out = {k: sum(t[k] for t in tables.values()) for k in SUMMED}
+    every = sum(t["keys_either_side"] for t in tables.values())
+    out["keys_either_side"] = every
+    out["coverage"] = None if not every else round(out["checked"] / every, 4)
+    out["verdict"] = report["verdict"]
+    out["mismatched"] = out["missing"] + out["extra"] + out["differing"]
+    return out
+
+
+def coverage_is_between_the_tables(report, line):
+    """Whether the rolled up coverage sits inside the range of the per table ones.
+
+    Tables holding no key at all report `None` and are left out. A ratio over an empty
+    denominator is not a small coverage. It is an absent one, and averaging it in as a zero
+    is how a table nobody wrote to drags a report toward a failure.
+    """
+    each = [t["coverage"] for t in report["tables"].values() if t["coverage"] is not None]
+    if not each or line["coverage"] is None:
+        return None
+    return min(each) <= line["coverage"] <= max(each)
