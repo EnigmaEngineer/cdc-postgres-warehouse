@@ -453,6 +453,86 @@ absent image and the count landed in the same place either way, so the branch wa
 nothing at all. Splitting the counter is what gave it something to do. That mutant and two
 more about the split now die.
 
+## Killing the consumer, and the resume point that is not one
+
+`scripts/chaos_probe.py` runs one change stream through a consumer that dies partway
+through a batch, restarts it, and grades the warehouse against the source. The crash is
+injected at three named points inside `apply_batch`'s transaction. After the staging. After
+the merge. After the tombstones with the ledger write still to come.
+
+Those three all pass, and that is the problem with them. The transaction holds, the ledger
+sits at six, no row anywhere carries batch seven. Replay is exact because the merge is
+idempotent, which was already true and already measured. A check that cannot fail is not
+evidence, so the interesting arms are the ones nobody asked for.
+
+| arm | resumed at | records dropped | rows missing | rows extra | source |
+|---|---|---|---|---|---|
+| `clean` | n/a | 0 | 0 | 0 | exact |
+| `resume_same_batching` | 7 | 0 | 0 | 0 | exact |
+| `resume_new_batching` | 7 | 30 | 6 | 5 | **wrong** |
+| `resume_new_batching_resized` | 7 | 0 | 0 | 0 | exact |
+| `resume_new_batching_all` | 1 | 0 | 0 | 0 | exact |
+| `offset_after_merge` | 7 | 0 | 0 | 0 | exact |
+| `offset_before_merge` | 8 | 0 | 40 | 34 | **wrong** |
+
+### A batch number is not an offset
+
+The ledger stores which batch was last applied. A batch is a slice of whatever the consumer
+drained, and a restarted consumer re-drains six partitions and gets a different
+interleaving, so its seventh batch is not the seventh batch that died. Resuming at
+`last_applied + 1` is correct only when the batching reproduces, and nothing about a broker
+makes it so.
+
+Same records and the same per partition order. Only the arrival moves. Thirty records land in
+neither the applied prefix nor the replayed suffix, and the warehouse ends six rows short
+and five rows wrong against the source.
+
+The damage is much smaller than the loss and that is what makes it dangerous. Thirty lost
+records produce eleven wrong rows, because most of them were superseded by a later change
+to the same key that did get replayed. A reconciliation run afterwards sees eleven rows and
+a live source, and the section above says exactly how a lagging target explains eleven rows
+away.
+
+### The size of the restart batch decides whether it is harmless or catastrophic
+
+The variable a consumer controls least is how many records the poll handed it. Below the
+original size the resume point lands short of what was applied, the overlap gets merged
+twice, and the idempotency absorbs it. Above it, everything between the two lands nowhere.
+
+| restart batch size | records dropped | merged twice |
+|---|---|---|
+| 100 | 0 | 900 |
+| 180 | 0 | 420 |
+| 250 | 30 | 30 |
+| 320 | 420 | 0 |
+| 400 | 900 | 0 |
+| 600 | 2,100 | 0 |
+
+Away from 250 the loss is the size difference times the six batches already applied, exactly,
+and the interleaving contributes nothing measurable on top. At 250 the size term is zero and
+what is left is the interleaving alone, which ran 23 to 68 records over eight restart orders
+and was never zero.
+
+**The two columns at 250 are one number, not two.** Two prefixes of equal length drawn from
+one stream miss and overlap by the same amount, so `dropped` and `applied_twice` are
+arithmetically forced to agree there and a report quoting both is quoting one.
+`resume_gap_is_two_numbers` says which case a reader is in. Every row where the sizes differ
+is a genuine pair.
+
+The fix is not a cleverer batch number. It is `replay_all`, which the idempotency makes
+cheap, and the last row of the first table is what says it costs nothing here.
+
+### The offset outside the transaction, in both orderings
+
+`SeparateOffsetStore` models the arrangement this project did not choose. Committing the
+offset after the merge is correct, replays one batch, and matches the clean warehouse
+exactly. Committing it before loses forty rows and gains thirty four, permanently, because
+the offset names a batch whose rows never landed and the consumer starts past it.
+
+Neither ordering fails on a run where nothing crashes. `check_the_ledger_and_the_offset_store_agree_when_nothing_crashes`
+asserts that they agree there, which is the point: the wrong one survives into production
+because the test everyone writes cannot see it.
+
 ## Three defaults that are wrong here
 
 `cdc/connector.py` refuses to emit a config that leaves any of these alone, and
@@ -602,7 +682,7 @@ count had a range of zero. What reproduces is the shape of the table.
 python tests/run_all.py
 ```
 
-206 checks, no database required. duckdb runs in process, so the merge checks need no
+244 checks, no database required. duckdb runs in process, so the merge checks need no
 server either. The workload planner and the decoded change reader and the schema come
 first. Then the connector config and the partitioner. Then the record shape and the
 delivery orders and the apply rules. Then the reduction and the merge statements and the
@@ -624,6 +704,13 @@ every other vector leaves the rule untested.
 that differs on exactly one column. Without the first, no rule about choosing between rows
 under one key ever runs. Without the second, a comparison that only looks at keys passes
 every check a comparison that looks at values would.
+
+`tests/test_recovery.py` states every recovery rule on a fixture that really loses
+something. A resume that drops no records passes whether or not the resume logic ran at
+all, so the clean case sits beside the losing one as a control rather than standing in as
+the evidence. It also carries the first checks in this repo over `warehouse.reconcile.run`,
+which is the reconciliation job's entry point and had none, because a real one needs
+Postgres and this suite does not.
 
 `tests/test_connector.py` opens with a list of legitimate Debezium properties the
 validator must not refuse. A guardrail is judged first on what it wrongly blocks, because
@@ -722,10 +809,22 @@ the repo is correct would do the same thing if it were scanning nothing.
 - **Nothing expires a soft deleted row.** The position it holds is the only reason it is
   there and the table grows forever. The window it really needs is a function of how far
   out of order records can arrive, which is not measured here.
-- **The batch id in the warehouse is not yet joined to a Kafka offset.** The ledger row
-  goes in inside the merge transaction, so the warehouse can say what it last applied. It
-  says a batch number that this repo assigns. Nothing has committed an offset to a broker,
-  so the half of the problem the ledger exists to solve is still modelled.
+- **The batch id in the warehouse is not yet joined to a Kafka offset**, and the chaos
+  arms are what say how much that matters. The ledger goes in inside the merge transaction
+  and is now read, and what it hands back is a batch number this repo assigns. Resuming on
+  one is wrong the moment the batching moves, which is measured above. The right thing to
+  store is the per partition offset the batch ended at, and that needs a broker.
+- **The crash is injected, not a process death.** `fail_at` raises inside the transaction
+  and the handler rolls back, which is what a real death gets from the database rather than
+  from a handler. It does not model the database itself dying, a half written page, or a
+  connection that vanishes with the transaction still open on the server. Every crash arm
+  here is one of the three cheap failures.
+- **The restart never re-reads the source.** Both delivery orders come from one slot read,
+  and a real restarted consumer reconnects and may see records the first one never got to.
+  So the arms measure re-batching and not re-reading, and the two are different.
+- **The batch size sweep varies one thing at a time and reality varies both.** A restarted
+  consumer picks up a different interleaving and a different batch size together. The
+  sweeps hold one fixed to say which term dominates, and the combined case is not run.
 - **`scripts/merge_probe.py` has no tests over its database plumbing**, the same gap as the
   other two probes. Every figure it prints comes out of `warehouse/merge.py` or
   `cdc/consumer.py`, which are tested. The part that opens a connection and resets a schema
