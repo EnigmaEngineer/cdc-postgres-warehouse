@@ -50,6 +50,9 @@ tested of the two.
         |  warehouse/reconcile.py   reads both ends and compares them key by key
         v
   missing, extra, differing, and how much of the table the verdict is about
+
+  warehouse/recovery.py    where a restarted consumer starts, and what that costs
+  warehouse/reproduce.py   grades this README's own figures against a fresh run
 ```
 
 Kafka and Kafka Connect are not running here yet. The connector config is generated and
@@ -682,7 +685,7 @@ count had a range of zero. What reproduces is the shape of the table.
 python tests/run_all.py
 ```
 
-244 checks, no database required. duckdb runs in process, so the merge checks need no
+270 checks, no database required. duckdb runs in process, so the merge checks need no
 server either. The workload planner and the decoded change reader and the schema come
 first. Then the connector config and the partitioner. Then the record shape and the
 delivery orders and the apply rules. Then the reduction and the merge statements and the
@@ -726,11 +729,16 @@ before and after. The one worth naming took the delete tuple and reported it as 
 image rather than a before image, which is a plausible reading of the plugin output and
 would have made every delete look like an insert of a two column row.
 
-The latest pass is 22 mutants over the merge and the statement builders and the tombstone
-gate. All 22 die now, control clean either side. Five survived the first attempt and every
-one of them was a real gap.
+The latest pass is 34 mutants over the figure grader. All 34 die, control clean either
+side. Nine survived the first attempt. Eight wanted a check and one wanted the code
+changing, because the character set it tested against carried a space that could never
+reach it, so an inclusive comparison and a strict one could not disagree.
 
-Two came from the same weak fixture. A delete envelope removes its own row, so its
+The pass before it is 50 mutants over the recovery logic and the reconciliation and the
+merge, all 50 killed. The one before that is 22 over the merge and the statement builders
+and the tombstone gate, where five survived the first attempt and every one was a real gap.
+
+Two of those five came from the same weak fixture. A delete envelope removes its own row, so its
 tombstone then finds nothing under the key, and a fixture that keeps the envelope cannot
 test the tombstone at all. Taking the gate off entirely and moving it off by one both
 survived. The checks now deliver a tombstone with its envelope removed, which is not an
@@ -775,8 +783,91 @@ is missing from `requirements.txt`, or when `requirements.txt` declares somethin
 imports. It also feeds itself a file it must not miss, because a check that passes when
 the repo is correct would do the same thing if it were scanning nothing.
 
+## Every published figure, re-measured
+
+Every table above was written on the day it was measured. That is the day the number was
+true. It says nothing about today.
+
+```
+python3 -m scripts.reproduction_report --markdown
+```
+
+This re-runs the commands this README prints, character for character, and grades what
+comes back against what the README says. The published side is read out of `README.md` at
+run time by `warehouse/reproduce.py`, addressed by heading and row and column. Nothing
+transcribes a number. That matters more than it sounds: a checker holding a hand typed copy
+of what the document used to say turns a wrong transcription into a figure that looks
+reproduced, which is the exact failure the tool exists to catch.
+
+A figure whose row the README has lost raises. So does an address matching two cells, which
+is real here, because five rows in this file are labelled `log_order`.
+
+Three kinds, not two. A count reproduces exactly or it is broken, with no tolerance band on
+purpose. A byte volume out of a database has a floor under it that is not zero, measured at
+0.0036 to 0.0403 percent across passes on identical work, so it gets a band of one tenth of
+a percent. A timing may move and is reported as moved.
+
+| figure | kind | published | re-measured | verdict | produced by |
+|---|---|---|---|---|---|
+| WAL bytes under DEFAULT | volume | 616,072 | 616,072 | EXACT | `replica_identity_probe` |
+| WAL bytes under FULL | volume | 665,488 | 665,488 | EXACT | `replica_identity_probe` |
+| pgoutput bytes under DEFAULT | volume | 297,077 | 297,018 | WITHIN_BAND | `replica_identity_probe` |
+| pgoutput bytes under FULL | volume | 386,657 | 386,732 | WITHIN_BAND | `replica_identity_probe` |
+| mean before fields under FULL | counted | 5.6284 | 5.6284 | EXACT | `replica_identity_probe` |
+| frames, one connector | counted | 2,652 | 2,652 | EXACT | `topic_layout_probe` |
+| framing, one connector | counted | 1,772 | 1,772 | EXACT | `topic_layout_probe` |
+| row changes, one connector | counted | 880 | 880 | EXACT | `topic_layout_probe` |
+| framing, four connectors | counted | 7,056 | 7,056 | EXACT | `topic_layout_probe` |
+| framing, product alone | counted | 1,765 | 1,765 | EXACT | `topic_layout_probe` |
+| retained after the workload | volume | 240,072 | 240,112 | WITHIN_BAND | `topic_layout_probe` |
+| retained after reading it all | volume | 238,368 | 238,368 | EXACT | `topic_layout_probe` |
+| missing on lag_25 | counted | 402 | 402 | EXACT | `reconcile_probe` |
+| differing on lag_25 | counted | 342 | 342 | EXACT | `reconcile_probe` |
+| set subtraction on lag_25 | counted | 1,163 | 1,163 | EXACT | `reconcile_probe` |
+| keys checked on lag_25 | counted | 786 | 786 | EXACT | `reconcile_probe` |
+| keys checked on lag_75 | counted | 122 | 122 | EXACT | `reconcile_probe` |
+| drift reported on lag_50 | counted | 1,286 | 1,286 | EXACT | `reconcile_probe` |
+| records dropped, new batching | counted | 30 | 30 | EXACT | `chaos_probe` |
+| rows missing, new batching | counted | 6 | 6 | EXACT | `chaos_probe` |
+| rows missing, offset before merge | counted | 40 | 40 | EXACT | `chaos_probe` |
+| dropped at restart batch 320 | counted | 420 | 420 | EXACT | `chaos_probe` |
+| dropped at restart batch 600 | counted | 2,100 | 2,100 | EXACT | `chaos_probe` |
+| merged twice at restart batch 100 | counted | 900 | 900 | EXACT | `chaos_probe` |
+| rows on log_order | counted | 1,777 | 1,777 | EXACT | `merge_probe` |
+| soft deleted on log_order | counted | 241 | 241 | EXACT | `merge_probe` |
+| rows on the versioned arm | counted | 4,280 | 4,280 | EXACT | `merge_probe` |
+| extra on the hard delete shuffle | counted | 98 | 98 | EXACT | `merge_probe` |
+
+Twenty five exact, three inside the band, nothing broken. All twenty three counted
+quantities came back to the digit.
+
+### The number that matters here is 12 percent
+
+That table grades 28 figures. This README publishes 233 numeric cells. So a pass that reads
+as "everything reproduces" covers one figure in eight, and I would rather print that than
+let the run of EXACT verdicts imply otherwise.
+
+The figure list is written by hand, so it grades what I remembered to put in it. The
+denominator is not. `reproduce.numeric_cells` walks every table in the file and counts
+every cell that parses as a number, so the coverage figure is derived from the document
+rather than asserted about it. The report prints it on every run.
+
+And the one wrong number in this README was outside the table entirely. A sentence under
+"Running the checks" said the latest mutation pass was 22 mutants. That was true when it
+was written and two passes had happened since. A figure in prose has no heading and no row and no column.
+There is nothing for a grader to address. It stayed wrong until I read the sentence. The tool cannot see the place the defect actually was.
+
 ## Known limitations
 
+- **The reproduction pass covers 28 of 233 published numeric cells.** The figure list is
+  hand written, so it grades what I thought to include. Every figure not in it is
+  unverified in exactly the way the whole section is about, and the honest read of a table
+  of EXACT verdicts is that a twelfth of the document reproduces.
+- **A figure in prose is unreachable.** The grader addresses a cell by heading and row and
+  column. A number in a sentence has none of those, and the only wrong number this pass
+  found was in a sentence. Every published figure could carry a machine readable marker
+  instead, which would take the coverage question off the table, and it would make the
+  document worse to read.
 - **The warehouse is duckdb and the Snowflake statements have never run.** Every merge
   figure here came off duckdb 1.5.5 in process. `warehouse/sql.py` generates the Snowflake
   text and a test asserts that each claim about Snowflake in that file is labelled
@@ -885,11 +976,38 @@ the repo is correct would do the same thing if it were scanning nothing.
 
 - **The `pgoutput` frames are counted and never parsed.** The probe opens a second slot on
   the same workload and reports the message count and the total bytes. That is enough to
-  say the binary stream a consumer reads grows by 1.3019 while its message count does not
-  move. It is not enough to say what is inside a frame, and no claim here rests on that.
+  say the binary stream a consumer reads grows by about 1.30 while its message count does
+  not move. It is not enough to say what is inside a frame, and no claim here rests on that.
+  Three runs of the script gave 1.3015, 1.3019 and 1.3020, so the first two decimals are
+  the ones worth quoting and I had been writing four.
 
-- **The 1.3019 ratio is a property of these four tables.** They are narrow. A table with a
+- **The 1.30 ratio is a property of these four tables.** They are narrow. A table with a
   text blob in it would push the before image cost higher, and I have not measured one.
+
+## What I would do next
+
+Four things, in the order I would do them.
+
+**Store the offset, not the batch number.** This is the big one and the chaos arms are what
+say so. The ledger hands back a number this code assigned, and a restarted consumer that
+re-drains six partitions gets a different interleaving, so resuming on it drops records the
+moment the batching moves. The right thing to write inside the merge transaction is the per
+partition offset the batch ended at. That needs a broker, which is why it is not here.
+
+**Run a Kafka Connect worker.** The connector config is generated from the catalog and
+validated against the 100 keys the connector really declares, which catches a misspelled
+property and three dangerous defaults. It does not catch a value the worker accepts and
+then rejects at runtime. Nothing here has posted the config to a REST endpoint.
+
+**Give the probes tests over their database plumbing.** Five scripts open a connection and
+reset a schema and none of that is covered. Everything they compute comes out of tested
+library code. The part that talks to Postgres does not, and one of them ran without a reset
+for a day and published a row count that grew on every run while the rate it printed held
+steady, which is exactly the shape nobody looks at twice.
+
+**Put a marker on every published figure.** The reproduction pass grades 28 of 233 numeric
+cells and cannot see a number in a sentence at all, which is where the only wrong figure
+turned out to be.
 
 ## What I would do differently already
 
