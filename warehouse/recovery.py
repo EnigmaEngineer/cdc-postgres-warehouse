@@ -133,11 +133,9 @@ class SeparateOffsetStore(object):
     def __init__(self, commit_before=False):
         self.commit_before = commit_before
         self.committed = 0
-        self.writes = 0
 
     def commit(self, batch):
         self.committed = batch
-        self.writes += 1
 
 
 def drive(warehouse, batches, merge_keys, start_at=1, fail_at=None, fail_in_batch=None,
