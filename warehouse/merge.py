@@ -31,8 +31,32 @@ is not a data retention feature here. It is the storage for the high water mark.
 
 import hashlib
 
+from cdc import topics
 from cdc.consumer import identity
+from load import workload
 from warehouse import sql as W
+
+# The topic prefix every probe uses. It is the `topic.prefix` the generated Debezium config
+# carries, so changing it here changes what the consumer is fed and what the config says.
+TOPIC_PREFIX = "shopcdc"
+
+# The columns a source row is compared on. Not every column in the table: `created_at` on
+# order_header moves under the load generator and is not part of what a merge has to get
+# right, so it is left out of the comparison rather than out of the schema.
+COMPARED_COLUMNS = {
+    "customer": ("customer_id", "email", "full_name", "country", "created_at", "updated_at"),
+    "product": ("product_id", "sku", "name", "price_cents", "active", "updated_at"),
+    "order_header": ("order_id", "customer_id", "status", "total_cents", "placed_at",
+                     "updated_at"),
+    "order_item": ("order_id", "line_no", "product_id", "qty", "unit_cents"),
+}
+
+PRIMARY_KEY_COLUMNS = {
+    "customer": ("customer_id",),
+    "product": ("product_id",),
+    "order_header": ("order_id",),
+    "order_item": ("order_id", "line_no"),
+}
 
 
 # The three moments inside `apply_batch`'s transaction where a consumer process can die.
@@ -73,6 +97,27 @@ class Target(object):
     @property
     def stage(self):
         return self.name + "_stage"
+
+
+def build_targets(prefix=TOPIC_PREFIX):
+    """The four targets, built once, here.
+
+    This used to live in `scripts/merge_probe.py` and three other scripts imported it from
+    there. A script importing a script is worse than either importing a library, and the
+    alternative that was avoided at the time was a fifth copy of the column lists. Four
+    copies of the plumbing around it did exist, and their bodies agreed by luck rather than
+    because anything compared them.
+    """
+    out = []
+    for table in workload.TABLES:
+        out.append(Target(
+            name="wh_" + table,
+            source_table="shop." + table,
+            topic=topics.topic_name(prefix, "shop", table),
+            columns=COMPARED_COLUMNS[table],
+            key_columns=PRIMARY_KEY_COLUMNS[table],
+        ))
+    return out
 
 
 def reduce_batch(events, targets_by_topic, merge_keys=None, versioned=False):

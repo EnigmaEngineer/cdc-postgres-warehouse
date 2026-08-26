@@ -37,6 +37,7 @@ from cdc import pg  # noqa: E402
 from cdc import topics  # noqa: E402
 from load import apply as applier  # noqa: E402
 from load import drive  # noqa: E402
+from warehouse import merge as wh  # noqa: E402
 from load import workload  # noqa: E402
 
 SLOT_A = "layout_wide"
@@ -61,16 +62,6 @@ def drop_probe_objects(cur):
         cur.execute("drop publication if exists " + per_table_pub(table))
 
 
-def reset_schema(cur, schema_path):
-    """Drop and reload the schema, so a run starts from the same place every time.
-
-    scripts/replica_identity_probe.py does this and this one did not, which is how the
-    key split arm ended up reporting a row count that grew every time it ran.
-    """
-    cur.execute("drop schema if exists shop cascade")
-    cur.execute("drop publication if exists cdc_shop")
-    with open(schema_path) as handle:
-        cur.execute(handle.read())
 
 
 def arm_plugins(cur):
@@ -119,7 +110,7 @@ def arm_filtered_and_laggard(cur, steps, seed, customers, products, schema_path=
     """
     drop_probe_objects(cur)
     if schema_path:
-        reset_schema(cur, schema_path)
+        drive.reset_schema(cur, schema_path)
     pg.create_slot(cur, SLOT_A, "pgoutput")
     # One publication and one slot per table, which is what splitting a connector per
     # table really means on the source side. All four are measured rather than one being
@@ -302,7 +293,7 @@ def main():
     parser.add_argument("--products", type=int, default=80)
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--partitions", type=int, default=6)
-    parser.add_argument("--prefix", default="shopcdc")
+    parser.add_argument("--prefix", default=wh.TOPIC_PREFIX)
     parser.add_argument("--schema", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "db", "schema.sql"))
     parser.add_argument("--no-reset", dest="reset", action="store_false",

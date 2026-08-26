@@ -39,8 +39,6 @@ from cdc import events  # noqa: E402
 from cdc import pg  # noqa: E402
 from load import drive  # noqa: E402
 from load import workload  # noqa: E402
-from scripts.merge_probe import COMPARED, PRIMARY_KEY_COLUMNS, PREFIX, build_targets
-from scripts.merge_probe import reset_schema  # noqa: E402
 from warehouse import merge as wh  # noqa: E402
 from warehouse import reconcile as rec  # noqa: E402
 from warehouse import sql as W  # noqa: E402
@@ -53,7 +51,7 @@ def apply_prefix(order, batch_size, merge_keys, fraction):
     cut = int(round(len(order) * fraction))
     applied, held = order[:cut], order[cut:]
     con = duckdb.connect()
-    warehouse = wh.Warehouse(con, build_targets())
+    warehouse = wh.Warehouse(con, wh.build_targets())
     warehouse.create()
     for i, batch in enumerate(wh.batches(applied, batch_size), start=1):
         warehouse.apply_batch(batch, i, merge_keys=merge_keys)
@@ -87,7 +85,7 @@ def set_difference_view(cur, warehouse):
     missing = extra = 0
     for target in warehouse.targets:
         table = target.source_table.split(".")[-1]
-        columns = COMPARED[table]
+        columns = wh.COMPARED_COLUMNS[table]
         got = consumer.compare(warehouse.live_rows(target.name, columns),
                                rec.read_source(cur, target, columns))
         missing += got["missing"]
@@ -104,11 +102,11 @@ def corrupt_one_excluded_row(warehouse, in_flight):
     """
     for target in warehouse.targets:
         table = target.source_table.split(".")[-1]
-        columns = COMPARED[table]
+        columns = wh.COMPARED_COLUMNS[table]
         keys = in_flight.get(table, set())
         if not keys:
             continue
-        key_cols = PRIMARY_KEY_COLUMNS[table]
+        key_cols = wh.PRIMARY_KEY_COLUMNS[table]
         moved = [c for c in columns if c not in key_cols]
         if not moved:
             continue
@@ -147,7 +145,7 @@ def main():
     cur.execute("show server_version")
     report["postgres"] = cur.fetchone()[0]
 
-    reset_schema(cur, os.path.join(here, "db", "schema.sql"))
+    drive.reset_schema(cur, os.path.join(here, "db", "schema.sql"))
     pg.drop_slot_if_exists(cur, SLOT)
     pg.create_slot(cur, SLOT, "test_decoding")
     report["workload"] = drive.run_workload(cur, args.seed, args.steps, args.customers,
@@ -160,7 +158,7 @@ def main():
     for table in workload.TABLES:
         primary_keys["shop." + table] = tuple(pg.primary_key_columns(cur, "shop." + table))
     key_columns = {t: events.key_columns_for(t, primary_keys) for t in primary_keys}
-    evs = events.stream(rows, key_columns, PREFIX)
+    evs = events.stream(rows, key_columns, wh.TOPIC_PREFIX)
     pg.drop_slot_if_exists(cur, SLOT)
 
     order = delivery.interleave(delivery.route(evs, args.partitions), args.seed)
@@ -177,8 +175,8 @@ def main():
         warehouse, held = apply_prefix(order, args.batch, primary_keys, fraction)
         by_table, key_counts = rec.keys_in_flight(held, primary_keys)
         by_table = {t.split(".")[-1]: v for t, v in by_table.items()}
-        naive = rec.run(cur, warehouse, COMPARED, short)
-        excluded = rec.run(cur, warehouse, COMPARED, short, in_flight_by_table=by_table)
+        naive = rec.run(cur, warehouse, wh.COMPARED_COLUMNS, short)
+        excluded = rec.run(cur, warehouse, wh.COMPARED_COLUMNS, short, in_flight_by_table=by_table)
         report["arms"][name] = {
             "records_applied": int(round(len(order) * fraction)),
             "records_held_back": len(held),
@@ -191,12 +189,12 @@ def main():
         }
         if name == "lag_50":
             broke = corrupt_one_excluded_row(warehouse, by_table)
-            after = rec.run(cur, warehouse, COMPARED, short, in_flight_by_table=by_table)
+            after = rec.run(cur, warehouse, wh.COMPARED_COLUMNS, short, in_flight_by_table=by_table)
             report["corruption_under_an_excluded_key"] = {
                 "broke": broke,
                 "verdict_with_exclusion": flat(after)["verdict"],
                 "verdict_without_exclusion":
-                    flat(rec.run(cur, warehouse, COMPARED, short))["verdict"],
+                    flat(rec.run(cur, warehouse, wh.COMPARED_COLUMNS, short))["verdict"],
             }
         warehouse.con.close()
 

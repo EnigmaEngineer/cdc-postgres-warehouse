@@ -43,49 +43,7 @@ from warehouse import merge as wh  # noqa: E402
 from warehouse import sql as W  # noqa: E402
 
 SLOT = "merge_probe"
-PREFIX = "shopcdc"
-
-COMPARED = {
-    "customer": ("customer_id", "email", "full_name", "country", "created_at", "updated_at"),
-    "product": ("product_id", "sku", "name", "price_cents", "active", "updated_at"),
-    "order_header": ("order_id", "customer_id", "status", "total_cents", "placed_at",
-                     "updated_at"),
-    "order_item": ("order_id", "line_no", "product_id", "qty", "unit_cents"),
-}
-
-PRIMARY_KEY_COLUMNS = {
-    "customer": ("customer_id",),
-    "product": ("product_id",),
-    "order_header": ("order_id",),
-    "order_item": ("order_id", "line_no"),
-}
-
-
-def reset_schema(cur, schema_path):
-    cur.execute("drop schema if exists shop cascade")
-    cur.execute("drop publication if exists cdc_shop")
-    with open(schema_path) as handle:
-        cur.execute(handle.read())
-
-
-def truth(cur, table, columns):
-    select = ", ".join("{}::text".format(c) for c in columns)
-    cur.execute("select {} from shop.{}".format(select, table))
-    return {tuple(r) for r in cur.fetchall()}
-
-
-def build_targets():
-    out = []
-    for table in workload.TABLES:
-        out.append(wh.Target(
-            name="wh_" + table,
-            source_table="shop." + table,
-            topic=topics.topic_name(PREFIX, "shop", table),
-            columns=COMPARED[table],
-            key_columns=PRIMARY_KEY_COLUMNS[table],
-        ))
-    return out
-
+PREFIX = wh.TOPIC_PREFIX
 
 def load(order, batch_size, merge_keys, versioned=False, guard=True, reduce=True,
          on_tombstone="delete", soft_delete=True, allow_error=False):
@@ -101,7 +59,7 @@ def load(order, batch_size, merge_keys, versioned=False, guard=True, reduce=True
     it did before this argument existed.
     """
     con = duckdb.connect()
-    warehouse = wh.Warehouse(con, build_targets(), versioned=versioned)
+    warehouse = wh.Warehouse(con, wh.build_targets(), versioned=versioned)
     warehouse.create()
     totals = {}
     error = None
@@ -130,7 +88,7 @@ def grade(warehouse, source, reference):
     tables = {}
     agrees = {}
     for table in workload.TABLES:
-        applied = warehouse.live_rows("wh_" + table, COMPARED[table])
+        applied = warehouse.live_rows("wh_" + table, wh.COMPARED_COLUMNS[table])
         tables[table] = consumer.compare(applied, source[table])
         ref = reference[table] if reference is not None else None
         agrees[table] = None if ref is None else {
@@ -147,7 +105,7 @@ def in_memory(order, merge_keys, guard=True, on_tombstone="delete"):
     out = {}
     for table in workload.TABLES:
         topic = topics.topic_name(PREFIX, "shop", table)
-        out[table] = consumer.as_row_set(result.rows, topic, COMPARED[table])
+        out[table] = consumer.as_row_set(result.rows, topic, wh.COMPARED_COLUMNS[table])
     return out, result.counters
 
 
@@ -173,7 +131,7 @@ def main():
     cur.execute("show server_version")
     report["postgres"] = cur.fetchone()[0]
 
-    reset_schema(cur, os.path.join(here, "db", "schema.sql"))
+    drive.reset_schema(cur, os.path.join(here, "db", "schema.sql"))
     pg.drop_slot_if_exists(cur, SLOT)
     pg.create_slot(cur, SLOT, "test_decoding")
     report["workload"] = drive.run_workload(cur, args.seed, args.steps,
@@ -187,7 +145,7 @@ def main():
     for table in workload.TABLES:
         primary_keys["shop." + table] = tuple(pg.primary_key_columns(cur, "shop." + table))
 
-    source = {t: truth(cur, t, COMPARED[t]) for t in workload.TABLES}
+    source = {t: drive.truth(cur, t, wh.COMPARED_COLUMNS[t]) for t in workload.TABLES}
     report["source_rows"] = {t: len(v) for t, v in source.items()}
     key_columns = {t: events.key_columns_for(t, primary_keys) for t in primary_keys}
     evs = events.stream(rows, key_columns, PREFIX)
@@ -242,7 +200,7 @@ def main():
     # Idempotency. The same batches applied twice into one warehouse have to leave the
     # identical table, batch column and all, or the word does not mean anything.
     con2 = duckdb.connect()
-    warehouse = wh.Warehouse(con2, build_targets())
+    warehouse = wh.Warehouse(con2, wh.build_targets())
     warehouse.create()
     batch_list = wh.batches(interleaved, args.batch)
     for i, batch in enumerate(batch_list, start=1):

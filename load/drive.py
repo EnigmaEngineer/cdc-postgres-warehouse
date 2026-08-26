@@ -15,6 +15,32 @@ from load import apply as applier
 from load import workload
 
 
+def reset_schema(cur, schema_path):
+    """Drop and reload the schema, so a run starts from the same place every time.
+
+    Four scripts carried a copy of this. Three of the four were byte identical and the
+    fourth differed only in its docstring, so nothing had drifted, and nothing was checking
+    either. One probe went without a reset for a whole day and its key split arm reported a
+    row count that grew on every run while the rate it printed held steady.
+    """
+    cur.execute("drop schema if exists shop cascade")
+    cur.execute("drop publication if exists cdc_shop")
+    with open(schema_path) as handle:
+        cur.execute(handle.read())
+
+
+def truth(cur, table, columns):
+    """The source table as a set of text tuples.
+
+    Cast in SQL rather than in Python. The decoded stream carries whatever the type's
+    output function printed, so asking the same server for the same rendering is the only
+    way to compare like with like.
+    """
+    select = ", ".join("{}::text".format(c) for c in columns)
+    cur.execute("select {} from shop.{}".format(select, table))
+    return {tuple(r) for r in cur.fetchall()}
+
+
 def seed_row_counts(customers, products):
     """What the planner has to be told already exists before it plans anything.
 

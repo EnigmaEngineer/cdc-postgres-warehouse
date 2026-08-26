@@ -40,67 +40,14 @@ from cdc import pg  # noqa: E402
 from cdc import topics  # noqa: E402
 from load import drive  # noqa: E402
 from load import workload  # noqa: E402
+from warehouse import merge as wh  # noqa: E402
 
 SLOT = "consumer_probe"
-PREFIX = "shopcdc"
+PREFIX = wh.TOPIC_PREFIX
 
 # The columns compared against the source, in the order the comparison uses. Every column
 # of every table, including the timestamps, because leaving one out means the arm that
 # corrupts exactly that column passes.
-COMPARED = {
-    "customer": ("customer_id", "email", "full_name", "country", "created_at", "updated_at"),
-    "product": ("product_id", "sku", "name", "price_cents", "active", "updated_at"),
-    "order_header": ("order_id", "customer_id", "status", "total_cents", "placed_at",
-                     "updated_at"),
-    "order_item": ("order_id", "line_no", "product_id", "qty", "unit_cents"),
-}
-
-KEY_STRATEGIES = {
-    "row": None,
-    "order": {"shop.order_item": ("order_id",)},
-}
-
-
-def reset_schema(cur, schema_path):
-    cur.execute("drop schema if exists shop cascade")
-    cur.execute("drop publication if exists cdc_shop")
-    with open(schema_path) as handle:
-        cur.execute(handle.read())
-
-
-def truth(cur, table, columns):
-    """The source table as a set of text tuples.
-
-    Cast in SQL rather than in Python. The decoded stream carries whatever the type's
-    output function printed, so asking the same server for the same rendering is the only
-    way to compare like with like.
-    """
-    select = ", ".join("{}::text".format(c) for c in columns)
-    cur.execute("select {} from shop.{}".format(select, table))
-    return {tuple(r) for r in cur.fetchall()}
-
-
-def build_arms(evs, partitions, seed, merge_keys):
-    """Every arm as a name, then a delivery order and the three settings that vary.
-
-    All but the last merge on the source primary key, which is what a consumer should do.
-    The last one keys its target by the record key instead, because that shortcut is the
-    thing the composite key argument is really about and it deserves a row of its own.
-    """
-    routed = delivery.route(evs, partitions)
-    order = delivery.interleave(routed, seed)
-    return [
-        ("log_order", list(evs), True, "delete", merge_keys),
-        ("interleaved", order, True, "delete", merge_keys),
-        ("interleaved_open", order, False, "delete", merge_keys),
-        ("shuffled", delivery.shuffle(evs, seed), True, "delete", merge_keys),
-        ("shuffled_open", delivery.shuffle(evs, seed), False, "delete", merge_keys),
-        ("compacted", delivery.compact(list(evs)), True, "delete", merge_keys),
-        ("interleaved_tombstone_ignored", order, True, "ignore", merge_keys),
-        ("interleaved_key_as_row", order, True, "delete", None),
-    ], routed
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=4000)
@@ -123,7 +70,7 @@ def main():
 
     report = {"settings": vars(args)}
 
-    reset_schema(cur, os.path.join(here, "db", "schema.sql"))
+    drive.reset_schema(cur, os.path.join(here, "db", "schema.sql"))
     pg.drop_slot_if_exists(cur, SLOT)
     pg.create_slot(cur, SLOT, "test_decoding")
 
@@ -148,7 +95,7 @@ def main():
             pg.primary_key_columns(cur, "shop." + table))
     report["primary_keys"] = {k: list(v) for k, v in primary_keys.items()}
 
-    source = {t: truth(cur, t, COMPARED[t]) for t in workload.TABLES}
+    source = {t: drive.truth(cur, t, wh.COMPARED_COLUMNS[t]) for t in workload.TABLES}
     report["source_rows"] = {t: len(v) for t, v in source.items()}
 
     cur.execute("select order_id, line_no from shop.order_item order by 1, 2")
@@ -184,7 +131,7 @@ def main():
             per_table = {}
             for table in workload.TABLES:
                 topic = topics.topic_name(PREFIX, "shop", table)
-                applied = consumer.as_row_set(result.rows, topic, COMPARED[table])
+                applied = consumer.as_row_set(result.rows, topic, wh.COMPARED_COLUMNS[table])
                 per_table[table] = consumer.compare(applied, source[table])
             strategy["arms"][arm_name] = {
                 "counters": result.counters,

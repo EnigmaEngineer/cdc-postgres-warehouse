@@ -37,18 +37,16 @@ from cdc import events  # noqa: E402
 from cdc import pg  # noqa: E402
 from load import drive  # noqa: E402
 from load import workload  # noqa: E402
-from scripts.merge_probe import COMPARED, PRIMARY_KEY_COLUMNS, build_targets  # noqa: E402
-from scripts.merge_probe import reset_schema, truth  # noqa: E402
 from warehouse import merge as wh  # noqa: E402
 from warehouse import recovery  # noqa: E402
 
 SLOT = "chaos_probe"
-PREFIX = "shopcdc"
+PREFIX = wh.TOPIC_PREFIX
 
 
 def fresh(versioned=False):
     con = duckdb.connect()
-    warehouse = wh.Warehouse(con, build_targets(), versioned=versioned)
+    warehouse = wh.Warehouse(con, wh.build_targets(), versioned=versioned)
     warehouse.create()
     return warehouse
 
@@ -59,7 +57,7 @@ def exactness(warehouse, source):
     missing = extra = 0
     exact = True
     for table in workload.TABLES:
-        got = consumer.compare(warehouse.live_rows("wh_" + table, COMPARED[table]),
+        got = consumer.compare(warehouse.live_rows("wh_" + table, wh.COMPARED_COLUMNS[table]),
                                source[table])
         missing += got["missing"]
         extra += got["extra"]
@@ -103,7 +101,7 @@ def main():
     cur.execute("show server_version")
     report["postgres"] = cur.fetchone()[0]
 
-    reset_schema(cur, os.path.join(here, "db", "schema.sql"))
+    drive.reset_schema(cur, os.path.join(here, "db", "schema.sql"))
     pg.drop_slot_if_exists(cur, SLOT)
     pg.create_slot(cur, SLOT, "test_decoding")
     report["workload"] = drive.run_workload(cur, args.seed, args.steps,
@@ -116,7 +114,7 @@ def main():
     primary_keys = {}
     for table in workload.TABLES:
         primary_keys["shop." + table] = tuple(pg.primary_key_columns(cur, "shop." + table))
-    source = {t: truth(cur, t, COMPARED[t]) for t in workload.TABLES}
+    source = {t: drive.truth(cur, t, wh.COMPARED_COLUMNS[t]) for t in workload.TABLES}
     key_columns = {t: events.key_columns_for(t, primary_keys) for t in primary_keys}
     evs = events.stream(rows, key_columns, PREFIX)
     pg.drop_slot_if_exists(cur, SLOT)
