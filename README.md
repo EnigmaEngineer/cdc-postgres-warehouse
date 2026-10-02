@@ -686,10 +686,14 @@ python tests/run_all.py
 ```
 
 270 checks, no database required. duckdb runs in process, so the merge checks need no
-server either. The workload planner and the decoded change reader and the schema come
-first. Then the connector config and the partitioner. Then the record shape and the
-delivery orders and the apply rules. Then the reduction and the merge statements and the
-soft delete.
+server either. The order they run in:
+
+```
+workload planner    decoded change reader    schema
+connector config    partitioner
+record shape        delivery orders          apply rules
+reduction           merge statements         soft delete
+```
 `tests/test_decode.py` uses real `test_decoding` output copied off a running server rather
 than lines written from memory, because a parser tested against invented input tests the
 author's memory of a format.
@@ -757,8 +761,8 @@ One was a check I had just improved. Moving the versioned check to three batches
 mutant about the join and revived one about the reduction, because a single record per batch
 has nothing to collapse. Both checks exist now. They are two different rules.
 
-The earlier pass, 26 mutants over the apply rules and the delivery orders and the record
-shape, is unchanged.
+The earlier pass is unchanged. It was 26 mutants over the apply rules, the delivery orders
+and the record shape.
 
 One was dead code. Taking the high water mark to `max(held, incoming)` cannot change
 anything, because the guard already dropped everything below the mark. A line no mutation

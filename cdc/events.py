@@ -7,7 +7,7 @@ record is the tombstone and it is the part that decides what the key choice cost
 Three things live here and nothing else.
 
     key           which columns become the record key, and the bytes they serialise to
-    envelope      the op and the two images and the position the consumer orders by
+    envelope      the op, the two images and the position the consumer orders by
     tombstone     the null valued record that follows a delete
 
 The source position is the write ahead log position of the change. It comes back from
