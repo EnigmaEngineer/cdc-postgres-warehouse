@@ -60,6 +60,9 @@ MERGE = "The merge, and the two things in it that are not what they look like"
 # not new ones, so they do not belong in the denominator.
 SELF = "Every published figure, re-measured"
 
+PUBLISHED = ("README.md", "docs/design-notes.md", "docs/running-the-checks.md",
+             "docs/limitations.md")
+
 FIGURES = [
     R.Figure("WAL bytes under DEFAULT", REPLICA, "DEFAULT", "WAL bytes", VOLUME,
              "replica_identity_probe"),
@@ -217,7 +220,10 @@ def main():
     args = ap.parse_args()
 
     raw = json.load(open(args.raw)) if args.raw else run(args)
-    readme = open(os.path.join(ROOT, "README.md")).read()
+    # The figures moved out of the README into docs/ when the front page was cut down.
+    # Read every file that used to be one README, in the order it used to run, so a
+    # figure is addressed by its heading wherever that heading now lives.
+    readme = "".join(open(os.path.join(ROOT, p)).read() for p in PUBLISHED)
     results = R.check(readme, FIGURES, observe(raw))
     counts = R.summarise(results)
     cov = R.coverage(readme, FIGURES, ignore_headings=[SELF])
